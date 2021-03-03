@@ -1,5 +1,5 @@
 mod tic_file;
-mod whitespace;
+mod lua;
 
 use anyhow::{anyhow, bail, Result};
 use clap::Clap;
@@ -38,8 +38,8 @@ fn main() -> Result<()> {
 
 #[derive(Clap)]
 struct CmdPack {
-    #[clap(short = 'k', long, about = "Don't strip whitespace/comments")]
-    no_strip_whitespace: bool,
+    #[clap(short = 'k', long, about = "Don't transform (whitespace/directives) as lua src")]
+    no_transform: bool,
     #[clap(short, long, about = "Strip chunks except for code and new palette")]
     strip: bool,
     #[clap(short, long, about = "Force new palette")]
@@ -100,8 +100,8 @@ impl CmdPack {
         }
 
         let mut code = code.ok_or_else(|| anyhow!("No code chunk found"))?;
-        if !self.no_strip_whitespace {
-            code = whitespace::strip_whitespace(&code);
+        if !self.no_transform {
+            code = lua::transform(&code);
         }
 
         if self.new_palette {

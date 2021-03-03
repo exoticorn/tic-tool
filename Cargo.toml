@@ -11,3 +11,5 @@ clap = { version = "3.0.0-beta.2", features = ["derive"] }
 libflate = "1"
 zopfli = "0.4"
 notify = "4"
+regex = "1.4"
+lazy_static = "1.4"

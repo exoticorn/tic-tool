@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+use regex::bytes::Regex;
+use lazy_static::lazy_static;
+
 struct Input<'a> {
     code: &'a [u8],
     pos: usize,
@@ -42,7 +46,51 @@ impl<'a> Input<'a> {
 pub fn transform(code: &[u8]) -> Vec<u8> {
     let tt = parse(code);
 
+    let tt = apply_renames(tt);
+
     serialize(&tt, b' ')
+}
+
+fn apply_renames(tt: Vec<TreeToken>) -> Vec<TreeToken> {
+    fn inner(mut tt: Vec<TreeToken>, outer_renames: &HashMap<Vec<u8>, Vec<u8>>) -> Vec<TreeToken> {
+        let mut renames = outer_renames.clone();
+        lazy_static! {
+            static ref  RE: Regex = Regex::new(r"^-- rename\s*(\w+)\s*->\s*(\w+)\s*$").unwrap();
+        }
+        tt.retain(|tok| {
+            if let &TreeToken::Token { type_: TokenType::Comment, ref text } = tok {
+                if let Some(caps) = RE.captures(text) {
+                    renames.insert(caps[1].to_vec(), caps[2].to_vec());
+                    return false;
+                }
+            }
+            true
+        });
+
+        let mut new_tt = vec![];
+
+        for token in tt {
+            match token {
+                TreeToken::Token { type_: TokenType::Identifier, ref text } => {
+                    if let Some(new_name) = renames.get(text) {
+                        new_tt.push(TreeToken::Token { type_: TokenType::Identifier, text: new_name.clone()});
+                    } else {
+                        new_tt.push(token);
+                    }
+                }
+                TreeToken::Token {..} => {
+                    new_tt.push(token);
+                }
+                TreeToken::SubTree(sub_tt) => {
+                    let mut sub_tt = inner(sub_tt, &renames);
+                    new_tt.append(&mut sub_tt);
+                }
+            }
+        }
+
+        new_tt
+    }
+    inner(tt, &HashMap::new())
 }
 
 fn flatten(tokens: &mut Vec<(TokenType, Vec<u8>)>, tt: &[TreeToken]) {
@@ -77,7 +125,6 @@ fn serialize(tt: &[TreeToken], ws: u8) -> Vec<u8> {
         last_token_type = token_type;
         last_token_text = token_text.as_slice();
     }
-    println!("{}", std::str::from_utf8(&code).unwrap());
     code
 }
 

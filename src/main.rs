@@ -15,8 +15,12 @@ struct Opts {
 
 #[derive(Clap)]
 enum SubCommand {
+    #[clap(about = "Create a .tic file with compressed code chunk")]
     Pack(CmdPack),
+    #[clap(about = "Extract code chunk of a .tic file")]
     Extract(CmdExtract),
+    #[clap(about = "Create an empty .tic file")]
+    Empty(CmdEmpty),
 }
 
 fn main() -> Result<()> {
@@ -25,6 +29,7 @@ fn main() -> Result<()> {
     match opts.cmd {
         SubCommand::Pack(pack) => pack.exec()?,
         SubCommand::Extract(cmd) => cmd.exec()?,
+        SubCommand::Empty(cmd) => cmd.exec()?
     }
 
     Ok(())
@@ -49,13 +54,13 @@ impl CmdPack {
     fn exec(self) -> Result<()> {
         self.run()?;
         if self.watch {
-            use notify::{Watcher, RecursiveMode, DebouncedEvent};
+            use notify::{DebouncedEvent, RecursiveMode, Watcher};
             let (tx, rx) = mpsc::channel();
             let mut watcher = notify::watcher(tx, Duration::from_millis(20))?;
 
             watcher.watch(&self.input, RecursiveMode::NonRecursive)?;
             loop {
-                if let DebouncedEvent::Write(_) =  rx.recv()? {
+                if let DebouncedEvent::Write(_) = rx.recv()? {
                     println!();
                     self.run()?;
                 }
@@ -79,7 +84,8 @@ impl CmdPack {
                     0x05 => code = Some(chunk.data),
                     0x10 => {
                         let mut unpacked = vec![];
-                        libflate::deflate::Decoder::new(&chunk.data[2..]).read_to_end(&mut unpacked)?;
+                        libflate::deflate::Decoder::new(&chunk.data[2..])
+                            .read_to_end(&mut unpacked)?;
                         code = Some(unpacked);
                     }
                     _ if self.strip => (),
@@ -140,6 +146,32 @@ impl CmdExtract {
         }
         let code = find_code(chunks)?;
         File::create(self.output)?.write_all(&code)?;
+        Ok(())
+    }
+}
+
+#[derive(Clap)]
+struct CmdEmpty {
+    #[clap(short, long, about = "Use new palette")]
+    new_palette: bool,
+    output: PathBuf,
+}
+
+impl CmdEmpty {
+    fn exec(self) -> Result<()> {
+        let mut chunks = vec![tic_file::Chunk {
+            type_: 0x05,
+            bank: 0,
+            data: vec![],
+        }];
+        if self.new_palette {
+            chunks.push(tic_file::Chunk {
+                type_: 0x11,
+                bank: 0,
+                data: vec![],
+            });
+        }
+        tic_file::save(self.output, &chunks)?;
         Ok(())
     }
 }

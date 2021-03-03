@@ -1,9 +1,10 @@
 mod tic_file;
 mod lua;
+mod cp437;
 
 use anyhow::{anyhow, bail, Result};
 use clap::Clap;
-use std::{fs::File, io::prelude::*, sync::mpsc, time::Duration};
+use std::{collections::HashMap, fs::File, io::prelude::*, sync::mpsc, time::Duration};
 
 use std::path::PathBuf;
 
@@ -178,6 +179,8 @@ impl CmdEmpty {
 }
 
 fn compress_code(code: Vec<u8>) -> tic_file::Chunk {
+    print_char_distribution(&code);
+
     println!("Uncompressed size: {:5} bytes", code.len());
     let mut data = vec![];
     zopfli::compress(
@@ -202,4 +205,39 @@ fn compress_code(code: Vec<u8>) -> tic_file::Chunk {
             data,
         }
     }
+}
+
+fn print_char_distribution(code: &[u8]) {
+    use crossterm::{style::{Color, Colors, SetColors, ResetColor}, ExecutableCommand};
+    use std::io::stdout;
+    let mut counts: HashMap<u8, usize> = HashMap::new();
+    for &c in code {
+        *counts.entry(c).or_default() += 1;
+    }
+    let mut counts: Vec<(u8, usize)> = counts.into_iter().collect();
+    counts.sort_by_key(|&(_, count)| count);
+    counts.reverse();
+    println!("Number of unique chars: {}", counts.len());
+    print!(" ");
+    for &(c, _) in &counts {
+        print!("{}", cp437::MAPPING[c as usize]);
+    }
+    println!();
+    print!(" ");
+    let mut stdout = stdout();
+    let colors = [Color::DarkRed, Color::DarkYellow, Color::Black, Color::DarkGreen, Color::DarkBlue, Color::DarkMagenta];
+    let blocks = ['\u{2588}', '\u{2593}', '\u{2592}', '\u{2591}', ' '];
+    for &(_, count) in &counts {
+        let heat = (count as f32 * counts.len() as f32 / code.len() as f32).ln() / 1.5f32.ln();
+        let heat = (0.5 - heat / 4.).max(0.).min(1.) * colors.len() as f32;
+        let index = (heat as usize).min(colors.len() - 2);
+        stdout.execute(SetColors(Colors::new(colors[index], colors[index+1]))).unwrap();
+        let frac = heat - index as f32;
+        let block_index = (frac * blocks.len() as f32 - 0.5).max(0.).min(blocks.len() as f32 - 1.) as usize;
+        print!("{}", blocks[block_index]);
+    }
+    stdout.execute(ResetColor).unwrap();
+    println!();
+
+    println!();
 }

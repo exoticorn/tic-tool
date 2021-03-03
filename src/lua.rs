@@ -2,47 +2,6 @@ use lazy_static::lazy_static;
 use regex::bytes::Regex;
 use std::collections::HashMap;
 
-struct Input<'a> {
-    code: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Input<'a> {
-    fn new(code: &[u8]) -> Input {
-        Input { code, pos: 0 }
-    }
-    fn next(&self) -> u8 {
-        if self.pos >= self.code.len() {
-            0
-        } else {
-            self.code[self.pos]
-        }
-    }
-    fn step(&mut self) -> u8 {
-        if self.pos < self.code.len() {
-            self.pos += 1;
-        }
-        self.next()
-    }
-    fn step_while<F: Fn(u8) -> bool>(&mut self, f: F) {
-        while self.next() != 0 && f(self.next()) {
-            self.pos += 1;
-        }
-    }
-    fn as_slice(&self) -> &[u8] {
-        &self.code[self.pos..]
-    }
-    fn take(&mut self) -> &'a [u8] {
-        let result = &self.code[..self.pos];
-        self.code = &self.code[self.pos..];
-        self.pos = 0;
-        result
-    }
-    fn reset(&mut self) {
-        self.pos = 0;
-    }
-}
-
 pub fn transform(code: &[u8]) -> Vec<u8> {
     let tt = parse(code);
 
@@ -218,8 +177,8 @@ fn serialize(tt: &[TreeToken], ws: u8) -> Vec<u8> {
     code
 }
 
-fn parse(code: &[u8]) -> TokenTree {
-    fn parse_subtree(tokens: &mut TokenTree, code: &mut Input) {
+fn parse(mut code: &[u8]) -> TokenTree {
+    fn parse_subtree(tokens: &mut TokenTree, code: &mut &[u8]) {
         loop {
             let (token_type, token_text) = next_token(code);
             if token_type == TokenType::EOF {
@@ -255,7 +214,6 @@ fn parse(code: &[u8]) -> TokenTree {
         }
     }
     let mut tokens = vec![];
-    let mut code = Input::new(code);
     parse_subtree(&mut tokens, &mut code);
 
     tokens
@@ -288,73 +246,87 @@ enum TokenType {
     Other,
 }
 
-fn next_token<'a>(code: &mut Input<'a>) -> (TokenType, &'a [u8]) {
-    code.step_while(|c| c.is_ascii_whitespace());
-    code.take();
-
-    let c = code.next();
-    code.step();
-
-    if c == 0 {
-        return (TokenType::EOF, code.take());
+fn next_token<'a>(code: &mut &'a [u8]) -> (TokenType, &'a [u8]) {
+    lazy_static! {
+        static ref WHITE_SPACE: Regex = Regex::new(r"\A\s+").unwrap();
+        static ref LONG_BRACKET_COMMENT: Regex = Regex::new(r"\A--\[=*\[").unwrap();
+        static ref COMMENT: Regex = Regex::new(r"\A--.*").unwrap();
+        static ref IDENTIFIER: Regex = Regex::new(r"\A[_a-zA-Z][_a-zA-Z0-9]*").unwrap();
+        static ref NUMBER: Regex = Regex::new(r"\A(0[xX]|\.\d|\d)[\da-fA-F\.]*([eE]-?\d+)?").unwrap();
+        static ref LONG_BRACKET: Regex = Regex::new(r"\A\[=*\[").unwrap();
     }
 
-    if c == b'-' && code.next() == b'-' {
-        code.step_while(|c| c != b'\n' && c != b'\r');
-        return (TokenType::Comment, code.take());
+    if let Some(m) = WHITE_SPACE.find(code) {
+        *code = &code[m.end()..];
     }
 
-    if c == b'_' || c.is_ascii_alphabetic() {
-        code.step_while(|c| c == b'_' || c.is_ascii_alphanumeric());
-        return (TokenType::Identifier, code.take());
+    if let Some(m) = LONG_BRACKET_COMMENT.find(code) {
+        let len = find_long_bracket_end(code, m.end() - 4);
+        let string = &code[..len];
+        *code = &code[len..];
+        return (TokenType::Comment, string);
     }
 
-    if c.is_ascii_digit() || c == b'.' {
-        if c == b'0' && code.next().to_ascii_lowercase() == b'x' {
-            code.step();
-        }
-        code.step_while(|c| c == b'.' || c.is_ascii_hexdigit());
-        return (TokenType::Number, code.take());
+    if let Some(m) = COMMENT.find(code) {
+        *code = &code[m.end()..];
+        return (TokenType::Comment, m.as_bytes());
     }
 
-    if c == b'"' || c == b'\'' {
-        loop {
-            if code.next() == c {
-                break;
-            }
-            if code.next() == b'\\' {
-                code.step();
-            }
-            code.step();
-        }
-        code.step();
+    if let Some(m) = IDENTIFIER.find(code) {
+        *code = &code[m.end()..];
+        return (TokenType::Identifier, m.as_bytes());
     }
 
-    if c == b'[' {
-        let mut count = 0;
-        while code.next() == b'=' {
-            count += 1;
-            code.step();
-        }
-        if code.next() == b'[' {
-            let mut end_marker = vec![b']'];
-            for _ in 0..count {
-                end_marker.push(b'=');
+    if let Some(m) = NUMBER.find(code) {
+        *code = &code[m.end()..];
+        return (TokenType::Number, m.as_bytes());
+    }
+
+    if code.len() > 0 {
+        if code[0] == b'"' || code[0] == b'\'' {
+            let delim = code[0];
+            let mut pos = 1;
+            while pos < code.len() {
+                let c = code[pos];
+                pos += 1;
+                if c == delim {
+                    break;
+                }
+                if c == b'\\' && pos < code.len() {
+                    pos += 1;
+                }
             }
-            end_marker.push(b']');
-            while code.next() != 0 && !code.as_slice().starts_with(&end_marker) {
-                code.step();
-            }
-            for _ in 0..(count + 2) {
-                code.step();
-            }
-        } else {
-            code.reset();
-            code.step();
+            let string = &code[..pos];
+            *code = &code[pos..];
+            return (TokenType::Other, string);
         }
     }
 
-    (TokenType::Other, code.take())
+    if let Some(m) = LONG_BRACKET.find(code) {
+        let len = find_long_bracket_end(code, m.end() - 2);
+        let string = &code[..len];
+        *code = &code[len..];
+        return (TokenType::Other, string);
+    }
+
+    if code.len() > 0 {
+        let tok = &code[..1];
+        *code = &code[1..];
+        return (TokenType::Other, tok);
+    }
+
+    return (TokenType::EOF, b"");
+}
+
+fn find_long_bracket_end(code: &[u8], level: usize) -> usize {
+    let mut p = 0;
+    while p + level + 2 < code.len() {
+        if code[p] == b']' && code[p + 1 + level] == b']' && (0..level).all(|o| code[p + 1 + o] == b'=') {
+            break;
+        }
+        p += 1;
+    }
+    p + 2 + level
 }
 
 #[cfg(test)]
@@ -362,7 +334,7 @@ mod test {
     use super::*;
     #[test]
     fn multiline_strings() {
-        let mut input = Input::new(b"[==[foo[=[bar]=]baz]==]...");
+        let mut input: &[u8] = b"[==[foo[=[bar]=]baz]==]...";
         let (tpe, bytes) = next_token(&mut input);
         assert_eq!(tpe, TokenType::Other);
         assert_eq!(bytes, b"[==[foo[=[bar]=]baz]==]");
@@ -370,7 +342,7 @@ mod test {
 
     #[test]
     fn strings() {
-        let mut input = Input::new(b"\"test\\\"a\\\"\"  'foo\\''");
+        let mut input: &[u8] = b"\"test\\\"a\\\"\"  'foo\\''";
         let (tpe, bytes) = next_token(&mut input);
         assert_eq!(tpe, TokenType::Other);
         assert_eq!(bytes, b"\"test\\\"a\\\"\"");

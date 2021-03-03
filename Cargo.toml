@@ -1,5 +1,5 @@
 [package]
-name = "tic-packer"
+name = "tic-tool"
 version = "0.1.0"
 authors = ["Dennis Ranke <dennis.ranke@gmail.com>"]
 edition = "2018"
@@ -10,3 +10,4 @@ bytes = "1"
 clap = { version = "3.0.0-beta.2", features = ["derive"] }
 libflate = "1"
 zopfli = "0.4"
+notify = "4"

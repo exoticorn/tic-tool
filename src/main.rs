@@ -1,41 +1,147 @@
 mod tic_file;
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 use clap::Clap;
-use std::{io::prelude::*, path::PathBuf};
+use std::{fs::File, io::prelude::*, sync::mpsc, time::Duration};
+
+use std::path::PathBuf;
 
 #[derive(Clap)]
 #[clap(version = "0.1.0", author = "Dennis Ranke <dennis.ranke@gmail.com>")]
 struct Opts {
-    input: PathBuf,
-    output: PathBuf,
+    #[clap(subcommand)]
+    pub cmd: SubCommand,
+}
+
+#[derive(Clap)]
+enum SubCommand {
+    Pack(CmdPack),
+    Extract(CmdExtract),
 }
 
 fn main() -> Result<()> {
     let opts = Opts::parse();
 
-    let chunks = tic_file::load(opts.input)?;
-
-    let mut out_chunks = vec![];
-
-    let mut new_palette_default: Option<tic_file::Chunk> = None;
-    for chunk in chunks {
-        match chunk.type_ {
-            0x11 => new_palette_default = Some(chunk),
-            0x05 => out_chunks.push(compress_code(chunk.data)),
-            0x10 => {
-                let mut unpacked = vec![];
-                libflate::deflate::Decoder::new(&chunk.data[2..]).read_to_end(&mut unpacked)?;
-                out_chunks.push(compress_code(unpacked));
-            }
-            _ => (),
-        }
+    match opts.cmd {
+        SubCommand::Pack(pack) => pack.exec()?,
+        SubCommand::Extract(cmd) => cmd.exec()?,
     }
-    out_chunks.extend(new_palette_default.into_iter());
-
-    tic_file::save(opts.output, &out_chunks)?;
 
     Ok(())
+}
+
+#[derive(Clap)]
+struct CmdPack {
+    #[clap(short = 'k', long, about = "Don't strip whitespace/comments")]
+    no_strip_whitespace: bool,
+    #[clap(short, long, about = "Strip chunks except for code and new palette")]
+    strip: bool,
+    #[clap(short, long, about = "Force new palette")]
+    new_palette: bool,
+    #[clap(short, long, about = "Watch for the source file to be updated")]
+    watch: bool,
+    #[clap(about = "Either a .tic file or source code")]
+    input: PathBuf,
+    output: PathBuf,
+}
+
+impl CmdPack {
+    fn exec(self) -> Result<()> {
+        self.run()?;
+        if self.watch {
+            use notify::{Watcher, RecursiveMode, DebouncedEvent};
+            let (tx, rx) = mpsc::channel();
+            let mut watcher = notify::watcher(tx, Duration::from_millis(20))?;
+
+            watcher.watch(&self.input, RecursiveMode::NonRecursive)?;
+            loop {
+                if let DebouncedEvent::Write(_) =  rx.recv()? {
+                    println!();
+                    self.run()?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn run(&self) -> Result<()> {
+        let mut out_chunks = vec![];
+
+        let mut new_palette_default: Option<tic_file::Chunk> = None;
+        let mut code: Option<Vec<u8>> = None;
+
+        if self.input.extension().map_or(false, |ext| ext == "tic") {
+            let chunks = tic_file::load(&self.input)?;
+            for chunk in chunks {
+                match chunk.type_ {
+                    0x11 => new_palette_default = Some(chunk),
+                    0x05 => code = Some(chunk.data),
+                    0x10 => {
+                        let mut unpacked = vec![];
+                        libflate::deflate::Decoder::new(&chunk.data[2..]).read_to_end(&mut unpacked)?;
+                        code = Some(unpacked);
+                    }
+                    _ if self.strip => (),
+                    _ => out_chunks.push(chunk),
+                }
+            }
+        } else {
+            let mut buffer = vec![];
+            File::open(&self.input)?.read_to_end(&mut buffer)?;
+            code = Some(buffer);
+        }
+
+        let mut code = code.ok_or_else(|| anyhow!("No code chunk found"))?;
+        if !self.no_strip_whitespace {
+            code = strip_whitespace(&code);
+        }
+
+        if self.new_palette {
+            new_palette_default = Some(tic_file::Chunk {
+                type_: 0x11,
+                bank: 0,
+                data: vec![],
+            });
+        }
+
+        out_chunks.push(compress_code(code));
+        out_chunks.extend(new_palette_default.into_iter());
+
+        tic_file::save(&self.output, &out_chunks)?;
+
+        Ok(())
+    }
+}
+
+#[derive(Clap)]
+struct CmdExtract {
+    input: PathBuf,
+    output: PathBuf,
+}
+
+impl CmdExtract {
+    fn exec(self) -> Result<()> {
+        let chunks = tic_file::load(self.input)?;
+        fn find_code(chunks: Vec<tic_file::Chunk>) -> Result<Vec<u8>> {
+            for chunk in chunks {
+                match chunk.type_ {
+                    0x05 => return Ok(chunk.data),
+                    0x10 => {
+                        let mut unpacked = vec![];
+                        libflate::deflate::Decoder::new(&chunk.data[2..])
+                            .read_to_end(&mut unpacked)?;
+                        return Ok(unpacked);
+                    }
+                    _ => (),
+                }
+            }
+            bail!("No code chunk found");
+        }
+        let code = find_code(chunks)?;
+        File::create(self.output)?.write_all(&code)?;
+        Ok(())
+    }
 }
 
 fn compress_code(code: Vec<u8>) -> tic_file::Chunk {

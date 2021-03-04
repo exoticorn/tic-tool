@@ -45,7 +45,7 @@ FLAGS:
     -w, --watch           Watch for the source file to be updated
 ```
 
-`tic-tool pack` reads either a `.tic` file, or just a source file (for example `.lua`) and outputs a `.tic` file with the source code compressed using the zopfli compression library.
+`tic-tool pack` reads either a `.tic` file, or just a source file (for example `.lua`) and outputs a `.tic` file with the source code compressed using the zopfli compression library and optionally shrunk by removing all unnecessary whitespace.
 
 When using a `.tic` file as input, `tic-tool` will keep all chunks other than code exactly as they are by default, except for making sure a `0x11` chunk if existing is placed at the very end so that it can be truncated, saving 3 bytes.
 

@@ -164,7 +164,14 @@ fn serialize(tt: &[TreeToken], ws: u8) -> Vec<u8> {
                 if token_text[0] == b'.'
                     || token_text[0].is_ascii_hexdigit()
                     || (token_text[0].to_ascii_lowercase() == b'x'
-                        && last_token_text.ends_with(b"0")) =>
+                        && (last_token_text == b"0" || last_token_text == b".0")) =>
+            {
+                code.push(ws);
+            }
+            TokenType::HexNumber
+                if token_text[0] == b'.'
+                    || token_text[0].is_ascii_hexdigit()
+                    || token_text[0].to_ascii_lowercase() == b'p' =>
             {
                 code.push(ws);
             }
@@ -242,6 +249,7 @@ enum TokenType {
     Comment,
     Identifier,
     Number,
+    HexNumber,
     EOF,
     Other,
 }
@@ -252,7 +260,9 @@ fn next_token<'a>(code: &mut &'a [u8]) -> (TokenType, &'a [u8]) {
         static ref LONG_BRACKET_COMMENT: Regex = Regex::new(r"\A--\[=*\[").unwrap();
         static ref COMMENT: Regex = Regex::new(r"\A--.*").unwrap();
         static ref IDENTIFIER: Regex = Regex::new(r"\A[_a-zA-Z][_a-zA-Z0-9]*").unwrap();
-        static ref NUMBER: Regex = Regex::new(r"\A(0[xX]|\.\d|\d)[\da-fA-F\.]*([eE]-?\d+)?").unwrap();
+        static ref NUMBER: Regex = Regex::new(r"\A(\d+(\.\d*)?|\.\d+)([eE]-?\d+)?").unwrap();
+        static ref HEXNUMBER: Regex =
+            Regex::new(r"\A0[xX][[:xdigit:]]*(\.[[:xdigit:]]*)?([pP]-?\d+)?").unwrap();
         static ref LONG_BRACKET: Regex = Regex::new(r"\A\[=*\[").unwrap();
     }
 
@@ -275,6 +285,11 @@ fn next_token<'a>(code: &mut &'a [u8]) -> (TokenType, &'a [u8]) {
     if let Some(m) = IDENTIFIER.find(code) {
         *code = &code[m.end()..];
         return (TokenType::Identifier, m.as_bytes());
+    }
+
+    if let Some(m) = HEXNUMBER.find(code) {
+        *code = &code[m.end()..];
+        return (TokenType::HexNumber, m.as_bytes());
     }
 
     if let Some(m) = NUMBER.find(code) {
@@ -321,7 +336,10 @@ fn next_token<'a>(code: &mut &'a [u8]) -> (TokenType, &'a [u8]) {
 fn find_long_bracket_end(code: &[u8], level: usize) -> usize {
     let mut p = 0;
     while p + level + 2 < code.len() {
-        if code[p] == b']' && code[p + 1 + level] == b']' && (0..level).all(|o| code[p + 1 + o] == b'=') {
+        if code[p] == b']'
+            && code[p + 1 + level] == b']'
+            && (0..level).all(|o| code[p + 1 + o] == b'=')
+        {
             break;
         }
         p += 1;
@@ -349,5 +367,32 @@ mod test {
         let (tpe, bytes) = next_token(&mut input);
         assert_eq!(tpe, TokenType::Other);
         assert_eq!(bytes, b"'foo\\''");
+    }
+
+    #[test]
+    fn number_spaces() {
+        assert_eq!(transform(b"ad=0x3FF9 poke(ad,r)"), b"ad=0x3FF9 poke(ad,r)");
+        assert_eq!(transform(b"ad=0x3FF9 x=1"), b"ad=0x3FF9x=1");
+        assert_eq!(transform(b"ad=0x3FF9 f=1"), b"ad=0x3FF9 f=1");
+        assert_eq!(transform(b"ad=0x3FF9.2 p=1"), b"ad=0x3FF9.2 p=1");
+        assert_eq!(transform(b"ad=0x3FF9.2p4 p=1"), b"ad=0x3FF9.2p4 p=1");
+        assert_eq!(transform(b"ad=0x3FF9.2p-4 p=1"), b"ad=0x3FF9.2p-4 p=1");
+
+        assert_eq!(transform(b"a=1 p=2"), b"a=1p=2");
+        assert_eq!(transform(b"a=1 e=2"), b"a=1 e=2");
+        assert_eq!(transform(b"a=0 x=2"), b"a=0 x=2");
+        assert_eq!(transform(b"a=.0 x=2"), b"a=.0 x=2");
+    }
+
+    #[test]
+    fn strings_spaces() {
+        assert_eq!(transform(b"a=\" a=2 b=3 \\\" \\ c=4 d=5 \" b=2"), b"a=\" a=2 b=3 \\\" \\ c=4 d=5 \"b=2");
+        assert_eq!(transform(b"a=' a=2 b=3 \\' \\ c=4 d=5 ' b=2"), b"a=' a=2 b=3 \\' \\ c=4 d=5 'b=2");
+        assert_eq!(transform(b"a=[==[ this is ]=] fun ]==] b = 2"), b"a=[==[ this is ]=] fun ]==]b=2");
+    }
+
+    #[test]
+    fn multiline_comments() {
+        assert_eq!(transform(b"a = --[=[ blah \n blub ]=] 4"), b"a=4");
     }
 }

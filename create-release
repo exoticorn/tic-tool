@@ -1,0 +1,20 @@
+#!/bin/bash
+
+trap 'echo "Release step failed"; exit $?' ERR
+
+cargo build --release --target x86_64-unknown-linux-musl
+cargo build --release --target x86_64-pc-windows-gnu
+
+VERSION=$(target/x86_64-unknown-linux-musl/release/tic-tool -V | awk '{print $2}')
+
+rm -rf release/
+
+mkdir -p release/tic-tool-$VERSION-linux
+cp LICENSE Readme.md target/x86_64-unknown-linux-musl/release/tic-tool release/tic-tool-$VERSION-linux
+
+mkdir -p release/tic-tool-$VERSION-win64
+cp LICENSE Readme.md target/x86_64-pc-windows-gnu/release/tic-tool.exe release/tic-tool-$VERSION-win64
+
+cd release
+tar czf tic-tool-$VERSION-linux.tgz tic-tool-$VERSION-linux
+zip  -r -9 tic-tool-$VERSION-win64.zip tic-tool-$VERSION-win64

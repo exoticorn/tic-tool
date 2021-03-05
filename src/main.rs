@@ -9,7 +9,7 @@ use std::{collections::HashMap, fs::File, io::prelude::*, sync::mpsc, time::Dura
 use std::path::PathBuf;
 
 #[derive(Clap)]
-#[clap(version = "0.1.0", author = "Dennis Ranke <dennis.ranke@gmail.com>")]
+#[clap(version = "0.1.1", author = "Dennis Ranke <dennis.ranke@gmail.com>")]
 struct Opts {
     #[clap(subcommand)]
     pub cmd: SubCommand,

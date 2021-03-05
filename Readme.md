@@ -1,4 +1,5 @@
 # tic-tool
+### v0.1.1
 
 `tic-tool` is asimple tool to process TIC-80 files (`.tic`). It's most important use is to compress the source code of a `.tic` file.
 

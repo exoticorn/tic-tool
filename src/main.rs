@@ -4,12 +4,12 @@ mod cp437;
 
 use anyhow::{anyhow, bail, Result};
 use clap::Clap;
+use flate2::write::ZlibEncoder;
 use std::{collections::HashMap, fs::File, io::prelude::*, sync::mpsc, time::Duration};
-
 use std::path::PathBuf;
 
 #[derive(Clap)]
-#[clap(version = "0.1.1", author = "Dennis Ranke <dennis.ranke@gmail.com>")]
+#[clap(version = "0.2.0", author = "Dennis Ranke <dennis.ranke@gmail.com>")]
 struct Opts {
     #[clap(subcommand)]
     pub cmd: SubCommand,
@@ -47,6 +47,8 @@ struct CmdPack {
     new_palette: bool,
     #[clap(short, long, about = "Watch for the source file to be updated")]
     watch: bool,
+    #[clap(short, long, default_value = "15", about = "Number of zopfli iterations (default 15)")]
+    iterations: u32,
     #[clap(about = "Either a .tic file or source code")]
     input: PathBuf,
     output: PathBuf,
@@ -113,7 +115,7 @@ impl CmdPack {
             });
         }
 
-        out_chunks.push(compress_code(code));
+        out_chunks.push(compress_code(code, self.iterations as i32));
         out_chunks.extend(new_palette_default.into_iter());
 
         tic_file::save(&self.output, &out_chunks)?;
@@ -178,20 +180,34 @@ impl CmdEmpty {
     }
 }
 
-fn compress_code(code: Vec<u8>) -> tic_file::Chunk {
+fn compress_code(code: Vec<u8>, iterations: i32) -> tic_file::Chunk {
     print_char_distribution(&code);
 
-    println!("Uncompressed size: {:5} bytes", code.len());
+    println!("         Uncompressed size: {:5} bytes", code.len());
     let mut data = vec![];
-    zopfli::compress(
-        &zopfli::Options::default(),
-        &zopfli::Format::Zlib,
+    zopfli_rs::compress(
+        &zopfli_rs::Options {
+            iterations,
+            ..Default::default()
+        },
+        &zopfli_rs::Format::Zlib,
         &code,
         &mut data,
     )
     .unwrap();
     data.truncate(data.len() - 4);
-    println!("  Compressed size: {:5} bytes", data.len());
+    println!("  Compressed size (Zopfli): {:5} bytes", data.len());
+
+    let mut zlib_encoder = ZlibEncoder::new(vec![], flate2::Compression::best());
+    zlib_encoder.write_all(&code).unwrap();
+    let mut dataz = zlib_encoder.finish().unwrap();
+    dataz.truncate(dataz.len() - 4);
+    println!("    Compressed size (zlib): {:5} bytes", dataz.len());
+
+    if dataz.len() < data.len() {
+        data = dataz;
+    }
+
     if code.len() <= data.len() {
         tic_file::Chunk {
             type_: 0x05,

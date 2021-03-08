@@ -50,7 +50,7 @@ pub fn save<P: AsRef<Path>>(filename: P, chunks: &[Chunk]) -> Result<()> {
             file.put(&chunk.data[..]);
         }
     }
-    println!("       Total size: {:5} bytes", file.len());
+    println!("                Total size: {:5} bytes", file.len());
     File::create(filename)?.write_all(&file[..])?;
     Ok(())
 }

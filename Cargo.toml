@@ -1,6 +1,6 @@
 [package]
 name = "tic-tool"
-version = "0.1.1"
+version = "0.2.0"
 authors = ["Dennis Ranke <dennis.ranke@gmail.com>"]
 edition = "2018"
 
@@ -9,7 +9,8 @@ anyhow = "1"
 bytes = "1"
 clap = { version = "3.0.0-beta.2", features = ["derive"] }
 libflate = "1"
-zopfli = "0.4"
+zopfli-rs = "0.1.1"
+flate2 = { version = "1", features = ["zlib"] }
 notify = "4"
 regex = "1.4"
 lazy_static = "1.4"

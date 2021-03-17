@@ -299,7 +299,7 @@ impl CmdAnalyze {
 
             match chunk.type_ {
                 0x10 => {
-                    deflate::analyze(&chunk.data[2..]);
+                    deflate::analyze(&chunk.data[2..]).disassemble();
                 }
                 _ => (),
             }

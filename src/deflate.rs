@@ -1,14 +1,16 @@
 use super::cp437;
 
-pub fn analyze(data: &[u8]) {
+pub fn analyze(data: &[u8]) -> Analysis {
     let mut bitstream = Bitstream::new(data);
     let mut unpacked = vec![];
+
+    let mut blocks: Vec<BlockAnalysis> = vec![];
 
     let mut is_final = false;
     while !is_final {
         is_final = bitstream.get_bit() == 1;
         let block_type = bitstream.get_bits(2);
-        dbg!(is_final, block_type);
+        let header_item = bitstream.take_item();
         match block_type {
             1 => {
                 let mut huff_lit_length = HuffmanBuilder::new();
@@ -20,48 +22,83 @@ pub fn analyze(data: &[u8]) {
                 let mut huff_distance = HuffmanBuilder::new();
                 huff_distance.add_codes(0..=31, 5);
 
-                decode_block(
+                let lz_items = decode_block(
                     &mut bitstream,
                     &mut unpacked,
                     huff_lit_length.build(),
                     huff_distance.build(),
                 );
+
+                blocks.push(BlockAnalysis {
+                    header_item,
+                    block_type: BlockType::StaticHuffman,
+                    lz: lz_items,
+                });
             }
             2 => {
                 let hlit = bitstream.get_bits(5) as usize;
                 let hdist = bitstream.get_bits(5) as usize;
                 let hclen = bitstream.get_bits(4) as usize;
+                let huff_header_item = bitstream.take_item();
                 let mut huff_header = HuffmanBuilder::new();
+                let mut huff_header_lengths = vec![];
                 for &code in &[
                     16u32, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
                 ][..hclen + 4]
                 {
-                    huff_header.add_code(code, bitstream.get_bits(3));
+                    let length = bitstream.get_bits(3);
+                    huff_header.add_code(code, length);
+                    huff_header_lengths.push((code, length, bitstream.take_item()));
                 }
                 let huff_header = huff_header.build();
                 let mut huff_lengths = vec![0u32; hlit + 257 + hdist + 1];
                 let mut pos = 0;
+                let mut huff_header_codes = vec![];
                 while pos < huff_lengths.len() {
-                    match huff_header.read(&mut bitstream) {
+                    let code = huff_header.read(&mut bitstream);
+                    let huff_item = bitstream.take_item();
+                    match code {
                         16 => {
-                            for _ in 0..bitstream.get_bits(2) + 3 {
+                            let count = bitstream.get_bits(2) + 3;
+                            huff_header_codes.push(HuffmanHeaderCode::Repeat {
+                                huff_item,
+                                count_item: bitstream.take_item(),
+                                count,
+                            });
+                            for _ in 0..count {
                                 huff_lengths[pos] = huff_lengths[pos - 1];
                                 pos += 1;
                             }
                         }
                         17 => {
-                            for _ in 0..bitstream.get_bits(3) + 3 {
+                            let count = bitstream.get_bits(3) + 3;
+                            huff_header_codes.push(HuffmanHeaderCode::Skip {
+                                huff_item,
+                                count_item: bitstream.take_item(),
+                                count,
+                            });
+                            for _ in 0..count {
                                 huff_lengths[pos] = 0;
                                 pos += 1;
                             }
                         }
                         18 => {
-                            for _ in 0..bitstream.get_bits(7) + 11 {
+                            let count = bitstream.get_bits(7) + 11;
+                            huff_header_codes.push(HuffmanHeaderCode::Skip {
+                                huff_item,
+                                count_item: bitstream.take_item(),
+                                count,
+                            });
+                            for _ in 0..count {
                                 huff_lengths[pos] = 0;
                                 pos += 1;
                             }
                         }
                         num_bits => {
+                            huff_header_codes.push(HuffmanHeaderCode::Length {
+                                huff_item,
+                                length: num_bits,
+                            });
                             huff_lengths[pos] = num_bits;
                             pos += 1;
                         }
@@ -77,16 +114,199 @@ pub fn analyze(data: &[u8]) {
                     huff_distance.add_code(code as u32, huff_lengths[hlit + 257 + code]);
                 }
 
-                decode_block(
+                let lz_items = decode_block(
                     &mut bitstream,
                     &mut unpacked,
                     huff_lit_length.build(),
                     huff_distance.build(),
                 );
+
+                blocks.push(BlockAnalysis {
+                    header_item,
+                    block_type: BlockType::DynamicHuffman {
+                        huff_header_item,
+                        hlit,
+                        hdist,
+                        hclen,
+                        huff_header_lengths,
+                        huff_header_codes,
+                    },
+                    lz: lz_items,
+                });
             }
             _ => panic!("Block type {} not implemented yet", block_type),
         }
     }
+    Analysis {
+        data: unpacked,
+        blocks,
+    }
+}
+
+pub struct Analysis {
+    data: Vec<u8>,
+    blocks: Vec<BlockAnalysis>,
+}
+
+impl Analysis {
+    pub fn disassemble(&self) {
+        let mut pos = 0;
+        for block in &self.blocks {
+            match block.block_type {
+                BlockType::StaticHuffman => {
+                    disass_line(&[&block.header_item], format!("static huffman block"));
+                }
+                BlockType::DynamicHuffman {
+                    ref huff_header_item,
+                    hlit,
+                    hdist,
+                    hclen,
+                    ref huff_header_lengths,
+                    ref huff_header_codes,
+                } => {
+                    disass_line(&[&block.header_item], format!("dynamic huffman block"));
+                    disass_line(
+                        &[huff_header_item],
+                        format!("hlit: {}, hdist: {}, hclen: {}", hlit, hdist, hclen),
+                    );
+                    for &(code, length, ref item) in huff_header_lengths {
+                        disass_line(
+                            &[item],
+                            format!("huffman encoding - code {:-2}, {} bits", code, length),
+                        );
+                    }
+                    let mut c = 0u32;
+                    for code in huff_header_codes {
+                        match *code {
+                            HuffmanHeaderCode::Length {
+                                ref huff_item,
+                                length,
+                            } => {
+                                let name = if c < 256 {
+                                    format!("'{}'", cp437::MAPPING[c as usize])
+                                } else if c == 256 { "EOB".to_string() } else if c < hlit as u32 + 257 {
+                                    format!("length({})", c - 257)
+                                } else {
+                                    format!("offset({})", c - 257 - hlit as u32)
+                                };
+                                disass_line(&[huff_item], format!("{} - {} bits", name, length));
+                                c += 1;
+                            }
+                            HuffmanHeaderCode::Repeat {
+                                ref huff_item,
+                                ref count_item,
+                                count,
+                            } => {
+                                disass_line(&[huff_item, count_item], format!("repeat {}x", count));
+                                c += count;
+                            }
+                            HuffmanHeaderCode::Skip {
+                                ref huff_item,
+                                ref count_item,
+                                count,
+                            } => {
+                                disass_line(&[huff_item, count_item], format!("skip {}", count));
+                                c += count;
+                            }
+                        }
+                    }
+                }
+            }
+
+            for lz_item in &block.lz {
+                match *lz_item {
+                    LzItem::EndOfBlock { ref item } => disass_line(&[item], format!("end of block")),
+                    LzItem::Literal { ref item, byte } => {
+                        disass_line(&[item], format!("lit '{}'", cp437::MAPPING[byte as usize]));
+                        pos += 1;
+                    }
+                    LzItem::Match { length, offset, ref length_base, ref length_ext, ref offset_base, ref offset_ext } => {
+                        let mut copy_string = String::new();
+                        for i in 0..length {
+                            copy_string.push(cp437::MAPPING[self.data[(pos - offset + i) as usize] as usize]);
+                        }
+                        pos += length;
+                        disass_line(&[length_base, length_ext, offset_base, offset_ext], format!("mtc {} @ {}: '{}'", length, offset, copy_string));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn disass_line(items: &[&BitstreamItem], text: String) {
+    let pos = items[0].pos;
+    print!("{:-4x}.{}", pos >> 3, pos & 7);
+    let mut padding = 24;
+    for item in items {
+        if item.length + 1 > padding {
+            print!("\n      ");
+            padding = 24;
+        }
+        print!(" ");
+        for i in (0..item.length).rev() {
+            print!("{}", (item.bits >> i) & 1);
+        }
+        padding -= item.length + 1;
+    }
+    for _ in 0..padding + 2 {
+        print!(" ");
+    }
+    println!("{}", text);
+}
+
+struct BlockAnalysis {
+    block_type: BlockType,
+    header_item: BitstreamItem,
+    lz: Vec<LzItem>,
+}
+
+enum BlockType {
+    //    Uncompressed,
+    StaticHuffman,
+    DynamicHuffman {
+        huff_header_item: BitstreamItem,
+        hlit: usize,
+        hdist: usize,
+        hclen: usize,
+        huff_header_lengths: Vec<(u32, u32, BitstreamItem)>,
+        huff_header_codes: Vec<HuffmanHeaderCode>,
+    },
+}
+
+enum LzItem {
+    Literal {
+        byte: u8,
+        item: BitstreamItem,
+    },
+    Match {
+        length: u32,
+        offset: u32,
+        length_base: BitstreamItem,
+        length_ext: BitstreamItem,
+        offset_base: BitstreamItem,
+        offset_ext: BitstreamItem,
+    },
+    EndOfBlock {
+        item: BitstreamItem,
+    },
+}
+
+enum HuffmanHeaderCode {
+    Length {
+        huff_item: BitstreamItem,
+        length: u32,
+    },
+    Repeat {
+        huff_item: BitstreamItem,
+        count_item: BitstreamItem,
+        count: u32,
+    },
+    Skip {
+        huff_item: BitstreamItem,
+        count_item: BitstreamItem,
+        count: u32,
+    },
 }
 
 fn decode_block(
@@ -94,19 +314,23 @@ fn decode_block(
     unpacked: &mut Vec<u8>,
     huff_lit_length: Huffman,
     huff_distance: Huffman,
-) {
+) -> Vec<LzItem> {
+    let mut lz_items = vec![];
     loop {
         let lit_length = huff_lit_length.read(bitstream);
+        let lit_length_item = bitstream.take_item();
         if lit_length == 256 {
-            return;
+            lz_items.push(LzItem::EndOfBlock {
+                item: lit_length_item,
+            });
+            return lz_items;
         }
 
         if lit_length < 256 {
-            println!(
-                "Literal: {} '{}'",
-                lit_length,
-                cp437::MAPPING[lit_length as usize]
-            );
+            lz_items.push(LzItem::Literal {
+                item: lit_length_item,
+                byte: lit_length as u8,
+            });
             unpacked.push(lit_length as u8);
         } else {
             let (extra_bits, base_length) = [
@@ -140,6 +364,9 @@ fn decode_block(
                 (0, 258),
             ][lit_length as usize - 257];
             let length = base_length + bitstream.get_bits(extra_bits);
+            let length_ext = bitstream.take_item();
+            let offset_index = huff_distance.read(bitstream);
+            let offset_base = bitstream.take_item();
             let (extra_bits, base_distance) = [
                 (0, 1),
                 (0, 2),
@@ -171,16 +398,22 @@ fn decode_block(
                 (12, 12289),
                 (13, 16385),
                 (13, 24577),
-            ][huff_distance.read(bitstream) as usize];
+            ][offset_index as usize];
             let distance = base_distance + bitstream.get_bits(extra_bits);
+            let offset_ext = bitstream.take_item();
+            lz_items.push(LzItem::Match {
+                length,
+                offset: distance,
+                length_base: lit_length_item,
+                length_ext,
+                offset_base,
+                offset_ext,
+            });
             let copy_base = unpacked.len() - distance as usize;
-            print!("copy {} from offset {}: '", length, distance);
             for i in 0..length {
                 let byte = unpacked[copy_base + i as usize];
                 unpacked.push(byte);
-                print!("{}", cp437::MAPPING[byte as usize]);
             }
-            println!("'");
         }
     }
 }
@@ -239,40 +472,46 @@ impl Huffman {
 
 struct Bitstream<'a> {
     data: &'a [u8],
+    pos: usize,
+    item_start: usize,
+}
+
+struct BitstreamItem {
+    pos: usize,
+    length: usize,
     bits: u32,
-    left: u32,
 }
 
 impl<'a> Bitstream<'a> {
     fn new(data: &'a [u8]) -> Bitstream<'a> {
         Bitstream {
             data,
-            bits: 0,
-            left: 0,
+            pos: 0,
+            item_start: 0,
         }
     }
 
     fn get_bit(&mut self) -> u32 {
-        self.ensure_bits(1);
-        let bit = self.bits & 1;
-        self.bits >>= 1;
-        self.left -= 1;
+        let bit = (self.data[self.pos >> 3] >> (self.pos & 7)) as u32 & 1;
+        self.pos += 1;
         bit
     }
 
     fn get_bits(&mut self, num_bits: u32) -> u32 {
-        self.ensure_bits(num_bits);
-        let value = self.bits & ((1 << num_bits) - 1);
-        self.bits >>= num_bits;
-        self.left -= num_bits;
+        let mut value = 0;
+        for i in 0..num_bits {
+            value |= self.get_bit() << i;
+        }
         value
     }
 
-    fn ensure_bits(&mut self, num_bits: u32) {
-        while self.left < num_bits {
-            self.bits |= (self.data[0] as u32) << self.left;
-            self.data = &self.data[1..];
-            self.left += 8;
-        }
+    fn take_item(&mut self) -> BitstreamItem {
+        let length = self.pos - self.item_start;
+        assert!(length <= 32);
+        let pos = self.item_start;
+        self.pos = pos;
+        let bits = self.get_bits(length as u32);
+        self.item_start = self.pos;
+        BitstreamItem { pos, length, bits }
     }
 }

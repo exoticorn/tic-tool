@@ -1,12 +1,13 @@
-mod tic_file;
-mod lua;
 mod cp437;
+mod deflate;
+mod lua;
+mod tic_file;
 
 use anyhow::{anyhow, bail, Result};
 use clap::Clap;
 use flate2::write::ZlibEncoder;
-use std::{collections::HashMap, fs::File, io::prelude::*, sync::mpsc, time::Duration};
 use std::path::PathBuf;
+use std::{collections::HashMap, fs::File, io::prelude::*, sync::mpsc, time::Duration};
 
 #[derive(Clap)]
 #[clap(version = "0.2.0", author = "Dennis Ranke <dennis.ranke@gmail.com>")]
@@ -23,6 +24,8 @@ enum SubCommand {
     Extract(CmdExtract),
     #[clap(about = "Create an empty .tic file")]
     Empty(CmdEmpty),
+    #[clap(about = "Print out detailed information about a .tic file")]
+    Analyze(CmdAnalyze),
 }
 
 fn main() -> Result<()> {
@@ -32,6 +35,7 @@ fn main() -> Result<()> {
         SubCommand::Pack(pack) => pack.exec()?,
         SubCommand::Extract(cmd) => cmd.exec()?,
         SubCommand::Empty(cmd) => cmd.exec()?,
+        SubCommand::Analyze(cmd) => cmd.exec()?,
     }
 
     Ok(())
@@ -39,7 +43,11 @@ fn main() -> Result<()> {
 
 #[derive(Clap)]
 struct CmdPack {
-    #[clap(short = 'k', long, about = "Don't transform (whitespace/directives) as lua src")]
+    #[clap(
+        short = 'k',
+        long,
+        about = "Don't transform (whitespace/directives) as lua src"
+    )]
     no_transform: bool,
     #[clap(short, long, about = "Strip chunks except for code and new palette")]
     strip: bool,
@@ -47,7 +55,12 @@ struct CmdPack {
     new_palette: bool,
     #[clap(short, long, about = "Watch for the source file to be updated")]
     watch: bool,
-    #[clap(short, long, default_value = "15", about = "Number of zopfli iterations (default 15)")]
+    #[clap(
+        short,
+        long,
+        default_value = "15",
+        about = "Number of zopfli iterations (default 15)"
+    )]
     iterations: u32,
     #[clap(about = "Either a .tic file or source code")]
     input: PathBuf,
@@ -224,7 +237,10 @@ fn compress_code(code: Vec<u8>, iterations: i32) -> tic_file::Chunk {
 }
 
 fn print_char_distribution(code: &[u8]) {
-    use crossterm::{style::{Color, Colors, SetColors, ResetColor}, ExecutableCommand};
+    use crossterm::{
+        style::{Color, Colors, ResetColor, SetColors},
+        ExecutableCommand,
+    };
     use std::io::stdout;
     let mut counts: HashMap<u8, usize> = HashMap::new();
     for &c in code {
@@ -241,19 +257,54 @@ fn print_char_distribution(code: &[u8]) {
     println!();
     print!(" ");
     let mut stdout = stdout();
-    let colors = [Color::DarkRed, Color::DarkYellow, Color::Black, Color::DarkGreen, Color::DarkBlue, Color::DarkMagenta];
+    let colors = [
+        Color::DarkRed,
+        Color::DarkYellow,
+        Color::Black,
+        Color::DarkGreen,
+        Color::DarkBlue,
+        Color::DarkMagenta,
+    ];
     let blocks = ['\u{2588}', '\u{2593}', '\u{2592}', '\u{2591}', ' '];
     for &(_, count) in &counts {
         let heat = (count as f32 * counts.len() as f32 / code.len() as f32).ln() / 1.5f32.ln();
         let heat = (0.5 - heat / 4.).max(0.).min(1.) * colors.len() as f32;
         let index = (heat as usize).min(colors.len() - 2);
-        stdout.execute(SetColors(Colors::new(colors[index], colors[index+1]))).unwrap();
+        stdout
+            .execute(SetColors(Colors::new(colors[index], colors[index + 1])))
+            .unwrap();
         let frac = heat - index as f32;
-        let block_index = (frac * blocks.len() as f32 - 0.5).max(0.).min(blocks.len() as f32 - 1.) as usize;
+        let block_index = (frac * blocks.len() as f32 - 0.5)
+            .max(0.)
+            .min(blocks.len() as f32 - 1.) as usize;
         print!("{}", blocks[block_index]);
     }
     stdout.execute(ResetColor).unwrap();
     println!();
 
     println!();
+}
+
+#[derive(Clap)]
+struct CmdAnalyze {
+    input: PathBuf,
+}
+
+impl CmdAnalyze {
+    fn exec(self) -> Result<()> {
+        let chunks = tic_file::load(self.input)?;
+
+        for chunk in chunks {
+            println!("Chunk {:02x} - len {}", chunk.type_, chunk.data.len());
+
+            match chunk.type_ {
+                0x10 => {
+                    deflate::analyze(&chunk.data[2..]);
+                }
+                _ => (),
+            }
+        }
+
+        Ok(())
+    }
 }

@@ -44,8 +44,10 @@ pub fn save<P: AsRef<Path>>(filename: P, chunks: &[Chunk]) -> Result<()> {
     let mut file = BytesMut::new();
     for (i, chunk) in chunks.iter().enumerate() {
         file.put_u8(chunk.type_ | (chunk.bank << 5));
-        if i + 1 < chunks.len() || !chunk.data.is_empty() {
+        if i + 1 < chunks.len() || !chunk.data.is_empty() || chunk.type_ != 0x11  {
             file.put_u16_le(chunk.data.len() as u16);
+        }
+        if i + 1 < chunks.len() || !chunk.data.is_empty() {
             file.put_u8(0);
             file.put(&chunk.data[..]);
         }

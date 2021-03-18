@@ -172,6 +172,10 @@ pub struct Analysis {
 }
 
 impl Analysis {
+    pub fn data(&self) -> &AnalysisData {
+        &self.data
+    }
+
     pub fn disassemble(&self) {
         let mut pos = 0;
         for block in &self.blocks {
@@ -317,12 +321,90 @@ impl Analysis {
             pos += 1;
         }
         println!("\n");
-        print!("Legend: :");
+        print!("Legend: ");
         for (i, &(b, f)) in colors.iter().enumerate() {
             print!("{}", crossterm::style::style(i + 1).with(f).on(b));
         }
         println!(" bits");
         Ok(())
+    }
+
+    pub fn print_sizes(&self) {
+        println!("Deflate bitstream size:");
+        let mut total = 0;
+        for (block_index, block) in self.blocks.iter().enumerate() {
+            let mut block_total = 3;
+            let huffman_size = match block.block_type {
+                BlockType::StaticHuffman => 0,
+                BlockType::DynamicHuffman {
+                    ref huff_header_item,
+                    ref huff_header_lengths,
+                    ref huff_header_codes,
+                    ..
+                } => {
+                    huff_header_item.length
+                        + huff_header_lengths
+                            .iter()
+                            .map(|(_, _, i)| i.length)
+                            .sum::<usize>()
+                        + huff_header_codes
+                            .iter()
+                            .map(|code| match code {
+                                HuffmanHeaderCode::Length { huff_item, .. } => huff_item.length,
+                                HuffmanHeaderCode::Repeat {
+                                    huff_item,
+                                    count_item,
+                                    ..
+                                } => huff_item.length + count_item.length,
+                                HuffmanHeaderCode::Skip {
+                                    huff_item,
+                                    count_item,
+                                    ..
+                                } => huff_item.length + count_item.length,
+                            })
+                            .sum::<usize>()
+                }
+            };
+            let body_size = block
+                .lz
+                .iter()
+                .map({
+                    |lz_item| match lz_item {
+                        LzItem::Literal { item, .. } => item.length,
+                        LzItem::Match {
+                            length_base,
+                            length_ext,
+                            offset_base,
+                            offset_ext,
+                            ..
+                        } => {
+                            length_base.length
+                                + length_ext.length
+                                + offset_base.length
+                                + offset_ext.length
+                        }
+                        LzItem::EndOfBlock { item } => item.length,
+                    }
+                })
+                .sum::<usize>();
+            block_total += huffman_size + body_size;
+            print!(
+                "block {:-2}: {:-4}'{} bytes = 0'3 bytes header + ",
+                block_index,
+                block_total >> 3,
+                block_total & 7
+            );
+            if huffman_size > 0 {
+                print!(
+                    "{}'{} bytes huffman tables + ",
+                    huffman_size >> 3,
+                    huffman_size & 7
+                );
+            }
+            println!("{}'{} bytes body", body_size >> 3, body_size & 7,);
+            total += block_total;
+        }
+        println!("   Total: {:-4}'{} bytes", total >> 3, total & 7);
     }
 }
 
@@ -347,10 +429,10 @@ fn disass_line(items: &[&BitstreamItem], text: String) {
     println!("{}", text);
 }
 
-struct AnalysisData {
-    unpacked: Vec<u8>,
-    literal_index: Vec<usize>,
-    cost: Vec<f32>,
+pub struct AnalysisData {
+    pub unpacked: Vec<u8>,
+    pub literal_index: Vec<usize>,
+    pub cost: Vec<f32>,
 }
 
 struct BlockAnalysis {

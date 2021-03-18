@@ -194,8 +194,6 @@ impl CmdEmpty {
 }
 
 fn compress_code(code: Vec<u8>, iterations: i32) -> tic_file::Chunk {
-    print_char_distribution(&code);
-
     let mut data = vec![];
     zopfli_rs::compress(
         &zopfli_rs::Options {
@@ -220,8 +218,15 @@ fn compress_code(code: Vec<u8>, iterations: i32) -> tic_file::Chunk {
         data = dataz;
     }
 
+    let analysis = deflate::analyze(&data[2..]);
+
+    print_char_distribution(analysis.data());
+
     println!("Heatmap:\n");
-    deflate::analyze(&data[2..]).print_heatmap().unwrap();
+    analysis.print_heatmap().unwrap();
+    println!();
+
+    analysis.print_sizes();
     println!();
 
     println!("         Uncompressed size: {:5} bytes", code.len());
@@ -243,15 +248,15 @@ fn compress_code(code: Vec<u8>, iterations: i32) -> tic_file::Chunk {
     }
 }
 
-fn print_char_distribution(code: &[u8]) {
-    use crossterm::{
-        style::{Color, Colors, ResetColor, SetColors},
-        ExecutableCommand,
-    };
-    use std::io::stdout;
+fn print_char_distribution(data: &deflate::AnalysisData) {
+    use crossterm::style::Color;
     let mut counts: HashMap<u8, usize> = HashMap::new();
-    for &c in code {
-        *counts.entry(c).or_default() += 1;
+    let mut total = 0;
+    for (&c, &lit_index) in data.unpacked.iter().zip(data.literal_index.iter()) {
+        if lit_index == usize::MAX {
+            *counts.entry(c).or_default() += 1;
+            total += 1;
+        }
     }
     let mut counts: Vec<(u8, usize)> = counts.into_iter().collect();
     counts.sort_by_key(|&(_, count)| count);
@@ -263,7 +268,6 @@ fn print_char_distribution(code: &[u8]) {
     }
     println!();
     print!(" ");
-    let mut stdout = stdout();
     let colors = [
         Color::DarkRed,
         Color::DarkYellow,
@@ -274,19 +278,20 @@ fn print_char_distribution(code: &[u8]) {
     ];
     let blocks = ['\u{2588}', '\u{2593}', '\u{2592}', '\u{2591}', ' '];
     for &(_, count) in &counts {
-        let heat = (count as f32 * counts.len() as f32 / code.len() as f32).ln() / 1.5f32.ln();
+        let heat = (count as f32 * counts.len() as f32 / total as f32).ln() / 1.5f32.ln();
         let heat = (0.5 - heat / 4.).max(0.).min(1.) * colors.len() as f32;
         let index = (heat as usize).min(colors.len() - 2);
-        stdout
-            .execute(SetColors(Colors::new(colors[index], colors[index + 1])))
-            .unwrap();
         let frac = heat - index as f32;
         let block_index = (frac * blocks.len() as f32 - 0.5)
             .max(0.)
             .min(blocks.len() as f32 - 1.) as usize;
-        print!("{}", blocks[block_index]);
+        print!(
+            "{}",
+            crossterm::style::style(blocks[block_index])
+                .with(colors[index])
+                .on(colors[index + 1])
+        );
     }
-    stdout.execute(ResetColor).unwrap();
     println!();
 
     println!();

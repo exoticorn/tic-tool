@@ -117,7 +117,7 @@ impl CmdPack {
 
         let mut code = code.ok_or_else(|| anyhow!("No code chunk found"))?;
         if !self.no_transform {
-            code = lua::transform(&code);
+            code = lua::Program::parse(&code).serialize(b' ');
         }
 
         if self.new_palette {

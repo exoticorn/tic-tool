@@ -2,67 +2,77 @@ use lazy_static::lazy_static;
 use regex::bytes::Regex;
 use std::collections::HashMap;
 
-pub fn transform(code: &[u8]) -> Vec<u8> {
-    let tt = parse(code);
-
-    let tt = apply_renames(tt);
-    let tt = apply_transform_to_load(tt);
-
-    serialize(&tt, b' ')
+pub struct Program {
+    tt: TokenTree,
+    renames: HashMap<Vec<u8>, Vec<u8>>,
 }
 
-fn apply_renames(tt: TokenTree) -> TokenTree {
-    fn inner(mut tt: TokenTree, outer_renames: &HashMap<Vec<u8>, Vec<u8>>) -> TokenTree {
-        let mut renames = outer_renames.clone();
-        lazy_static! {
-            static ref RE: Regex = Regex::new(r"^--\s*rename\s*(\w+)\s*->\s*(\w+)\s*$").unwrap();
-        }
-        tt.retain(|tok| {
-            if let &TreeToken::Token {
-                type_: TokenType::Comment,
-                ref text,
-            } = tok
-            {
-                if let Some(caps) = RE.captures(text) {
-                    renames.insert(caps[1].to_vec(), caps[2].to_vec());
-                    return false;
-                }
-            }
-            true
-        });
-
-        let mut new_tt = vec![];
-
-        for token in tt {
-            match token {
-                TreeToken::Token {
-                    type_: TokenType::Identifier,
-                    ref text,
-                } => {
-                    if let Some(new_name) = renames.get(text) {
-                        new_tt.push(TreeToken::Token {
-                            type_: TokenType::Identifier,
-                            text: new_name.clone(),
-                        });
-                    } else {
-                        new_tt.push(token);
-                    }
-                }
-                TreeToken::Token { .. } => {
-                    new_tt.push(token);
-                }
-                TreeToken::SubTree(sub_tt) => {
-                    new_tt.push(TreeToken::SubTree(inner(sub_tt, &renames)));
-                }
-            }
-        }
-
-        new_tt
+impl Program {
+    pub fn parse(code: &[u8]) -> Program {
+        let tt = parse(code);
+        let (tt, renames) = find_renames(tt);
+        Program { tt, renames }
     }
-    inner(tt, &HashMap::new())
+
+    pub fn serialize(&self, ws: u8) -> Vec<u8> {
+        let tt = apply_renames(&self.tt, &self.renames);
+        let tt = apply_transform_to_load(tt, ws);
+        serialize(&tt, ws)
+    }
 }
 
-fn apply_transform_to_load(tt: TokenTree) -> TokenTree {
+fn find_renames(mut tt: TokenTree) -> (TokenTree, HashMap<Vec<u8>, Vec<u8>>) {
+    let mut renames = HashMap::new();
+    lazy_static! {
+        static ref RE: Regex = Regex::new(r"^--\s*rename\s*(\w+)\s*->\s*(\w+)\s*$").unwrap();
+    }
+    tt.retain(|tok| {
+        if let &TreeToken::Token {
+            type_: TokenType::Comment,
+            ref text,
+        } = tok
+        {
+            if let Some(caps) = RE.captures(text) {
+                renames.insert(caps[1].to_vec(), caps[2].to_vec());
+                return false;
+            }
+        }
+        true
+    });
+    (tt, renames)
+}
+
+fn apply_renames(tt: &TokenTree, renames: &HashMap<Vec<u8>, Vec<u8>>) -> TokenTree {
+    let mut new_tt = vec![];
+
+    for token in tt {
+        match *token {
+            TreeToken::Token {
+                type_: TokenType::Identifier,
+                ref text,
+            } => {
+                if let Some(new_name) = renames.get(text) {
+                    new_tt.push(TreeToken::Token {
+                        type_: TokenType::Identifier,
+                        text: new_name.clone(),
+                    });
+                } else {
+                    new_tt.push(token.clone());
+                }
+            }
+            TreeToken::Token { .. } => {
+                new_tt.push(token.clone());
+            }
+            TreeToken::SubTree(ref sub_tt) => {
+                new_tt.push(TreeToken::SubTree(apply_renames(sub_tt, renames)));
+            }
+        }
+    }
+
+    new_tt
+}
+
+fn apply_transform_to_load(tt: TokenTree, ws: u8) -> TokenTree {
     let mut new_tt = vec![];
 
     let mut transform_next = false;
@@ -99,7 +109,7 @@ fn apply_transform_to_load(tt: TokenTree) -> TokenTree {
                 };
 
                 if let Some(name) = func_name {
-                    let body = serialize(&sub_tt[4..(sub_tt.len() - 1)], b' ');
+                    let body = serialize(&sub_tt[4..(sub_tt.len() - 1)], ws);
                     let mut string = vec![b'"'];
                     for c in body {
                         if c == b'"' {
@@ -226,7 +236,7 @@ fn parse(mut code: &[u8]) -> TokenTree {
     tokens
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum TreeToken {
     Token { type_: TokenType, text: Vec<u8> },
     SubTree(TokenTree),
@@ -369,6 +379,10 @@ mod test {
         assert_eq!(bytes, b"'foo\\''");
     }
 
+    fn transform(code: &[u8]) -> Vec<u8> {
+        Program::parse(code).serialize(b' ')
+    }
+
     #[test]
     fn number_spaces() {
         assert_eq!(transform(b"ad=0x3FF9 poke(ad,r)"), b"ad=0x3FF9 poke(ad,r)");
@@ -386,9 +400,18 @@ mod test {
 
     #[test]
     fn strings_spaces() {
-        assert_eq!(transform(b"a=\" a=2 b=3 \\\" \\ c=4 d=5 \" b=2"), b"a=\" a=2 b=3 \\\" \\ c=4 d=5 \"b=2");
-        assert_eq!(transform(b"a=' a=2 b=3 \\' \\ c=4 d=5 ' b=2"), b"a=' a=2 b=3 \\' \\ c=4 d=5 'b=2");
-        assert_eq!(transform(b"a=[==[ this is ]=] fun ]==] b = 2"), b"a=[==[ this is ]=] fun ]==]b=2");
+        assert_eq!(
+            transform(b"a=\" a=2 b=3 \\\" \\ c=4 d=5 \" b=2"),
+            b"a=\" a=2 b=3 \\\" \\ c=4 d=5 \"b=2"
+        );
+        assert_eq!(
+            transform(b"a=' a=2 b=3 \\' \\ c=4 d=5 ' b=2"),
+            b"a=' a=2 b=3 \\' \\ c=4 d=5 'b=2"
+        );
+        assert_eq!(
+            transform(b"a=[==[ this is ]=] fun ]==] b = 2"),
+            b"a=[==[ this is ]=] fun ]==]b=2"
+        );
     }
 
     #[test]

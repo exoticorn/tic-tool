@@ -1,1 +1,4 @@
 /target
+/release
+*.tic
+*.lua

@@ -1,8 +1,13 @@
 use super::cp437;
+use anyhow::Result;
 
 pub fn analyze(data: &[u8]) -> Analysis {
     let mut bitstream = Bitstream::new(data);
-    let mut unpacked = vec![];
+    let mut data = AnalysisData {
+        unpacked: vec![],
+        literal_index: vec![],
+        cost: vec![],
+    };
 
     let mut blocks: Vec<BlockAnalysis> = vec![];
 
@@ -24,7 +29,7 @@ pub fn analyze(data: &[u8]) -> Analysis {
 
                 let lz_items = decode_block(
                     &mut bitstream,
-                    &mut unpacked,
+                    &mut data,
                     huff_lit_length.build(),
                     huff_distance.build(),
                 );
@@ -116,7 +121,7 @@ pub fn analyze(data: &[u8]) -> Analysis {
 
                 let lz_items = decode_block(
                     &mut bitstream,
-                    &mut unpacked,
+                    &mut data,
                     huff_lit_length.build(),
                     huff_distance.build(),
                 );
@@ -137,14 +142,32 @@ pub fn analyze(data: &[u8]) -> Analysis {
             _ => panic!("Block type {} not implemented yet", block_type),
         }
     }
-    Analysis {
-        data: unpacked,
-        blocks,
+
+    let mut ref_count = vec![0usize; data.unpacked.len()];
+    for &index in &data.literal_index {
+        if index != usize::MAX {
+            ref_count[index] += 1;
+        }
     }
+    let mut shifted = vec![];
+    for (&index, &cost) in data.literal_index.iter().zip(data.cost.iter()) {
+        if index != usize::MAX {
+            let delta = (data.cost[index] - cost) / (ref_count[index] + 1) as f32;
+            shifted.push(delta);
+            shifted[index] -= delta;
+        } else {
+            shifted.push(0.);
+        }
+    }
+    for (cost, delta) in data.cost.iter_mut().zip(shifted.into_iter()) {
+        *cost += delta;
+    }
+
+    Analysis { data, blocks }
 }
 
 pub struct Analysis {
-    data: Vec<u8>,
+    data: AnalysisData,
     blocks: Vec<BlockAnalysis>,
 }
 
@@ -184,7 +207,9 @@ impl Analysis {
                             } => {
                                 let name = if c < 256 {
                                     format!("'{}'", cp437::MAPPING[c as usize])
-                                } else if c == 256 { "EOB".to_string() } else if c < hlit as u32 + 257 {
+                                } else if c == 256 {
+                                    "EOB".to_string()
+                                } else if c < hlit as u32 + 257 {
                                     format!("length({})", c - 257)
                                 } else {
                                     format!("offset({})", c - 257 - hlit as u32)
@@ -215,22 +240,89 @@ impl Analysis {
 
             for lz_item in &block.lz {
                 match *lz_item {
-                    LzItem::EndOfBlock { ref item } => disass_line(&[item], format!("end of block")),
+                    LzItem::EndOfBlock { ref item } => {
+                        disass_line(&[item], format!("end of block"))
+                    }
                     LzItem::Literal { ref item, byte } => {
                         disass_line(&[item], format!("lit '{}'", cp437::MAPPING[byte as usize]));
                         pos += 1;
                     }
-                    LzItem::Match { length, offset, ref length_base, ref length_ext, ref offset_base, ref offset_ext } => {
+                    LzItem::Match {
+                        length,
+                        offset,
+                        ref length_base,
+                        ref length_ext,
+                        ref offset_base,
+                        ref offset_ext,
+                    } => {
                         let mut copy_string = String::new();
                         for i in 0..length {
-                            copy_string.push(cp437::MAPPING[self.data[(pos - offset + i) as usize] as usize]);
+                            copy_string.push(
+                                cp437::MAPPING
+                                    [self.data.unpacked[(pos - offset + i) as usize] as usize],
+                            );
                         }
                         pos += length;
-                        disass_line(&[length_base, length_ext, offset_base, offset_ext], format!("mtc {} @ {}: '{}'", length, offset, copy_string));
+                        disass_line(
+                            &[length_base, length_ext, offset_base, offset_ext],
+                            format!("mtc {} @ {}: '{}'", length, offset, copy_string),
+                        );
                     }
                 }
             }
         }
+    }
+
+    pub fn print_heatmap(&self) -> Result<()> {
+        use crossterm::{
+            style::{Attribute, Color},
+            terminal,
+        };
+        let colors = [
+            (Color::DarkCyan, Color::White),
+            (Color::DarkGreen, Color::White),
+            (Color::Black, Color::White),
+            (Color::DarkBlue, Color::White),
+            (Color::DarkMagenta, Color::White),
+            (Color::DarkYellow, Color::White),
+            (Color::Red, Color::Black),
+            (Color::White, Color::Black),
+        ];
+        let term_width = terminal::size()?.0.min(120);
+        let mut pos = 1;
+        print!(" ");
+        for ((&byte, &cost), &ref_index) in self
+            .data
+            .unpacked
+            .iter()
+            .zip(self.data.cost.iter())
+            .zip(self.data.literal_index.iter())
+        {
+            if pos + 1 == term_width {
+                print!("\n ");
+                pos = 1;
+            }
+            let color = colors[(cost.round() as usize).max(1).min(8) - 1];
+            print!(
+                "{}",
+                crossterm::style::style(cp437::MAPPING[byte as usize])
+                    .with(color.1)
+                    .on(color.0)
+                    .attribute(if ref_index == usize::MAX {
+                        Attribute::NoUnderline
+                    } else {
+                        Attribute::Underlined
+                    })
+            );
+            pos += 1;
+        }
+        println!("\n");
+        print!("Legend: :");
+        for (i, &(b, f)) in colors.iter().enumerate() {
+            print!("{}", crossterm::style::style(i + 1).with(f).on(b));
+        }
+        println!(" bits");
+        Ok(())
     }
 }
 
@@ -253,6 +345,12 @@ fn disass_line(items: &[&BitstreamItem], text: String) {
         print!(" ");
     }
     println!("{}", text);
+}
+
+struct AnalysisData {
+    unpacked: Vec<u8>,
+    literal_index: Vec<usize>,
+    cost: Vec<f32>,
 }
 
 struct BlockAnalysis {
@@ -311,7 +409,7 @@ enum HuffmanHeaderCode {
 
 fn decode_block(
     bitstream: &mut Bitstream,
-    unpacked: &mut Vec<u8>,
+    data: &mut AnalysisData,
     huff_lit_length: Huffman,
     huff_distance: Huffman,
 ) -> Vec<LzItem> {
@@ -327,11 +425,13 @@ fn decode_block(
         }
 
         if lit_length < 256 {
+            data.cost.push(lit_length_item.length as f32);
             lz_items.push(LzItem::Literal {
                 item: lit_length_item,
                 byte: lit_length as u8,
             });
-            unpacked.push(lit_length as u8);
+            data.unpacked.push(lit_length as u8);
+            data.literal_index.push(usize::MAX);
         } else {
             let (extra_bits, base_length) = [
                 (0, 3),
@@ -401,6 +501,11 @@ fn decode_block(
             ][offset_index as usize];
             let distance = base_distance + bitstream.get_bits(extra_bits);
             let offset_ext = bitstream.take_item();
+            let cost = (lit_length_item.length
+                + length_ext.length
+                + offset_base.length
+                + offset_ext.length) as f32
+                / length as f32;
             lz_items.push(LzItem::Match {
                 length,
                 offset: distance,
@@ -409,10 +514,16 @@ fn decode_block(
                 offset_base,
                 offset_ext,
             });
-            let copy_base = unpacked.len() - distance as usize;
+            let copy_base = data.unpacked.len() - distance as usize;
             for i in 0..length {
-                let byte = unpacked[copy_base + i as usize];
-                unpacked.push(byte);
+                let lit_index = data.literal_index[copy_base + i as usize];
+                data.literal_index.push(if lit_index == usize::MAX {
+                    copy_base + i as usize
+                } else {
+                    lit_index
+                });
+                data.unpacked.push(data.unpacked[copy_base + i as usize]);
+                data.cost.push(cost);
             }
         }
     }

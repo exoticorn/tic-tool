@@ -196,7 +196,6 @@ impl CmdEmpty {
 fn compress_code(code: Vec<u8>, iterations: i32) -> tic_file::Chunk {
     print_char_distribution(&code);
 
-    println!("         Uncompressed size: {:5} bytes", code.len());
     let mut data = vec![];
     zopfli_rs::compress(
         &zopfli_rs::Options {
@@ -209,17 +208,25 @@ fn compress_code(code: Vec<u8>, iterations: i32) -> tic_file::Chunk {
     )
     .unwrap();
     data.truncate(data.len() - 4);
-    println!("  Compressed size (Zopfli): {:5} bytes", data.len());
+    let zopfli_size = data.len();
 
     let mut zlib_encoder = ZlibEncoder::new(vec![], flate2::Compression::best());
     zlib_encoder.write_all(&code).unwrap();
     let mut dataz = zlib_encoder.finish().unwrap();
     dataz.truncate(dataz.len() - 4);
-    println!("    Compressed size (zlib): {:5} bytes", dataz.len());
+    let zlib_size = dataz.len();
 
     if dataz.len() < data.len() {
         data = dataz;
     }
+
+    println!("Heatmap:\n");
+    deflate::analyze(&data[2..]).print_heatmap().unwrap();
+    println!();
+
+    println!("         Uncompressed size: {:5} bytes", code.len());
+    println!("  Compressed size (Zopfli): {:5} bytes", zopfli_size);
+    println!("    Compressed size (zlib): {:5} bytes", zlib_size);
 
     if code.len() <= data.len() {
         tic_file::Chunk {
@@ -299,7 +306,9 @@ impl CmdAnalyze {
 
             match chunk.type_ {
                 0x10 => {
-                    deflate::analyze(&chunk.data[2..]).disassemble();
+                    let analysis = deflate::analyze(&chunk.data[2..]);
+                    analysis.disassemble();
+                    analysis.print_heatmap()?;
                 }
                 _ => (),
             }

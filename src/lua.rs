@@ -11,12 +11,12 @@ impl Program {
     pub fn parse(code: &[u8]) -> Program {
         let tt = parse(code);
         let (tt, renames) = find_renames(tt);
+        let tt = apply_transform_to_load(tt);
         Program { tt, renames }
     }
 
     pub fn serialize(&self, ws: u8) -> Vec<u8> {
         let tt = apply_renames(&self.tt, &self.renames);
-        let tt = apply_transform_to_load(tt, ws);
         serialize(&tt, ws)
     }
 }
@@ -30,6 +30,7 @@ fn find_renames(mut tt: TokenTree) -> (TokenTree, HashMap<Vec<u8>, Vec<u8>>) {
         if let &TreeToken::Token {
             type_: TokenType::Comment,
             ref text,
+            ..
         } = tok
         {
             if let Some(caps) = RE.captures(text) {
@@ -50,10 +51,12 @@ fn apply_renames(tt: &TokenTree, renames: &HashMap<Vec<u8>, Vec<u8>>) -> TokenTr
             TreeToken::Token {
                 type_: TokenType::Identifier,
                 ref text,
+                ..
             } => {
                 if let Some(new_name) = renames.get(text) {
                     new_tt.push(TreeToken::Token {
                         type_: TokenType::Identifier,
+                        offset: 0,
                         text: new_name.clone(),
                     });
                 } else {
@@ -66,13 +69,16 @@ fn apply_renames(tt: &TokenTree, renames: &HashMap<Vec<u8>, Vec<u8>>) -> TokenTr
             TreeToken::SubTree(ref sub_tt) => {
                 new_tt.push(TreeToken::SubTree(apply_renames(sub_tt, renames)));
             }
+            TreeToken::CodeString(ref sub_tt) => {
+                new_tt.push(TreeToken::CodeString(apply_renames(sub_tt, renames)));
+            }
         }
     }
 
     new_tt
 }
 
-fn apply_transform_to_load(tt: TokenTree, ws: u8) -> TokenTree {
+fn apply_transform_to_load(tt: TokenTree) -> TokenTree {
     let mut new_tt = vec![];
 
     let mut transform_next = false;
@@ -81,6 +87,7 @@ fn apply_transform_to_load(tt: TokenTree, ws: u8) -> TokenTree {
             TreeToken::Token {
                 type_: TokenType::Comment,
                 ref text,
+                ..
             } => {
                 lazy_static! {
                     static ref RE: Regex = Regex::new(r"^--\s*transform\s*to\s*load\s*$").unwrap();
@@ -109,54 +116,62 @@ fn apply_transform_to_load(tt: TokenTree, ws: u8) -> TokenTree {
                 };
 
                 if let Some(name) = func_name {
-                    let body = serialize(&sub_tt[4..(sub_tt.len() - 1)], ws);
-                    let mut string = vec![b'"'];
-                    for c in body {
-                        if c == b'"' {
-                            string.push(b'\\');
-                        }
-                        string.push(c);
-                    }
-                    string.push(b'"');
+                    let body = sub_tt[4..(sub_tt.len() - 1)].to_vec();
                     new_tt.push(TreeToken::Token {
                         type_: TokenType::Identifier,
+                        offset: 0,
                         text: name.to_vec(),
                     });
                     new_tt.push(TreeToken::Token {
                         type_: TokenType::Other,
+                        offset: 0,
                         text: b"=".to_vec(),
                     });
                     new_tt.push(TreeToken::Token {
                         type_: TokenType::Identifier,
+                        offset: 0,
                         text: b"load".to_vec(),
                     });
-                    new_tt.push(TreeToken::Token {
-                        type_: TokenType::Other,
-                        text: string,
-                    });
+                    new_tt.push(TreeToken::CodeString(body));
                     transform_next = false;
                 } else {
                     new_tt.push(token);
                 }
             }
+            TreeToken::CodeString(..) => new_tt.push(token),
         }
     }
 
     new_tt
 }
 
-fn flatten(tokens: &mut Vec<(TokenType, Vec<u8>)>, tt: &[TreeToken]) {
+fn flatten(tokens: &mut Vec<(TokenType, Vec<u8>)>, tt: &[TreeToken], ws: u8) {
     for token in tt {
         match *token {
-            TreeToken::Token { type_, ref text } => tokens.push((type_, text.clone())),
-            TreeToken::SubTree(ref sub_tt) => flatten(tokens, sub_tt),
+            TreeToken::Token {
+                type_, ref text, ..
+            } => tokens.push((type_, text.clone())),
+            TreeToken::SubTree(ref sub_tt) => flatten(tokens, sub_tt, ws),
+            TreeToken::CodeString(ref sub_tt) => {
+                let body = serialize(sub_tt, ws);
+                let mut string = vec![b'"'];
+                for c in body {
+                    if c == b'"' {
+                        string.push(b'\\');
+                    }
+                    string.push(c);
+                }
+                string.push(b'"');
+
+                tokens.push((TokenType::String, string));
+            }
         }
     }
 }
 
 fn serialize(tt: &[TreeToken], ws: u8) -> Vec<u8> {
     let mut tokens = vec![];
-    flatten(&mut tokens, &tt);
+    flatten(&mut tokens, &tt, ws);
 
     let mut code = vec![];
     let (mut last_token_type, mut last_token_text): (TokenType, &[u8]) = (TokenType::Other, &[]);
@@ -194,10 +209,11 @@ fn serialize(tt: &[TreeToken], ws: u8) -> Vec<u8> {
     code
 }
 
-fn parse(mut code: &[u8]) -> TokenTree {
-    fn parse_subtree(tokens: &mut TokenTree, code: &mut &[u8]) {
+fn parse(code: &[u8]) -> TokenTree {
+    fn parse_subtree(tokens: &mut TokenTree, code: &[u8], offset: &mut usize) {
         loop {
-            let (token_type, token_text) = next_token(code);
+            let token_start = *offset;
+            let (token_type, token_text) = next_token(code, offset);
             if token_type == TokenType::EOF {
                 return;
             }
@@ -206,23 +222,26 @@ fn parse(mut code: &[u8]) -> TokenTree {
                     let mut sub_tokens = vec![];
                     sub_tokens.push(TreeToken::Token {
                         type_: token_type,
+                        offset: token_start,
                         text: token_text.to_vec(),
                     });
-                    parse_subtree(&mut sub_tokens, code);
+                    parse_subtree(&mut sub_tokens, code, offset);
                     tokens.push(TreeToken::SubTree(sub_tokens));
                     continue;
                 }
                 if token_text == b"do" || token_text == b"if" {
                     tokens.push(TreeToken::Token {
                         type_: token_type,
+                        offset: token_start,
                         text: token_text.to_vec(),
                     });
-                    parse_subtree(tokens, code);
+                    parse_subtree(tokens, code, offset);
                     continue;
                 }
             }
             tokens.push(TreeToken::Token {
                 type_: token_type,
+                offset: token_start,
                 text: token_text.to_vec(),
             });
             if token_type == TokenType::Identifier && token_text == b"end" {
@@ -231,15 +250,85 @@ fn parse(mut code: &[u8]) -> TokenTree {
         }
     }
     let mut tokens = vec![];
-    parse_subtree(&mut tokens, &mut code);
+    let mut offset = 0;
+    parse_subtree(&mut tokens, code, &mut offset);
 
-    tokens
+    fn parse_load_functions(tt: TokenTree) -> TokenTree {
+        let mut new_tt = vec![];
+
+        let mut index = 0;
+        while index < tt.len() {
+            let token = &tt[index];
+            index += 1;
+            match (token, tt.get(index)) {
+                (
+                    &TreeToken::Token {
+                        type_: TokenType::Identifier,
+                        text: ref fn_name,
+                        ..
+                    },
+                    Some(&TreeToken::Token {
+                        type_: TokenType::String,
+                        offset,
+                        ref text,
+                    }),
+                ) if fn_name == b"load" => {
+                    let mut code = vec![];
+                    let mut offset_map: HashMap<usize, usize> = HashMap::new();
+                    let mut pos = 1;
+                    while pos + 1 < text.len() {
+                        offset_map.insert(code.len(), offset + pos);
+                        code.push(match text[pos] {
+                            b'\\' => {
+                                pos += 1;
+                                match text[pos] {
+                                    b'n' => b'\n',
+                                    b'r' => b'\r',
+                                    b't' => b'\t',
+                                    b'\\' => b'\\',
+                                    o => o,
+                                }
+                            }
+                            o => o,
+                        });
+                        pos += 1;
+                    }
+                    let mut sub_tt = parse(&code);
+                    fn remap(tt: &mut TokenTree, offset_map: &HashMap<usize, usize>) {
+                        for token in tt {
+                            match token {
+                                TreeToken::Token { ref mut offset, .. } => {
+                                    *offset = *offset_map.get(offset).unwrap()
+                                }
+                                TreeToken::SubTree(ref mut sub_tt) => remap(sub_tt, offset_map),
+                                TreeToken::CodeString(ref mut sub_tt) => remap(sub_tt, offset_map),
+                            }
+                        }
+                    }
+                    remap(&mut sub_tt, &offset_map);
+                    new_tt.push(token.clone());
+                    new_tt.push(TreeToken::CodeString(sub_tt));
+                    index += 1;
+                }
+                _ => new_tt.push(token.clone()),
+            }
+        }
+
+        new_tt
+    }
+
+    parse_load_functions(tokens)
 }
 
 #[derive(Debug, Clone)]
 enum TreeToken {
-    Token { type_: TokenType, text: Vec<u8> },
+    Token {
+        type_: TokenType,
+        offset: usize,
+        text: Vec<u8>,
+    },
     SubTree(TokenTree),
+    CodeString(TokenTree),
 }
 
 impl TreeToken {
@@ -260,11 +349,12 @@ enum TokenType {
     Identifier,
     Number,
     HexNumber,
+    String,
     EOF,
     Other,
 }
 
-fn next_token<'a>(code: &mut &'a [u8]) -> (TokenType, &'a [u8]) {
+fn next_token<'a>(code: &'a [u8], offset: &mut usize) -> (TokenType, &'a [u8]) {
     lazy_static! {
         static ref WHITE_SPACE: Regex = Regex::new(r"\A\s+").unwrap();
         static ref LONG_BRACKET_COMMENT: Regex = Regex::new(r"\A--\[=*\[").unwrap();
@@ -276,34 +366,36 @@ fn next_token<'a>(code: &mut &'a [u8]) -> (TokenType, &'a [u8]) {
         static ref LONG_BRACKET: Regex = Regex::new(r"\A\[=*\[").unwrap();
     }
 
-    if let Some(m) = WHITE_SPACE.find(code) {
-        *code = &code[m.end()..];
+    if let Some(m) = WHITE_SPACE.find(&code[*offset..]) {
+        *offset += m.end();
     }
+
+    let code = &code[*offset..];
 
     if let Some(m) = LONG_BRACKET_COMMENT.find(code) {
         let len = find_long_bracket_end(code, m.end() - 4);
         let string = &code[..len];
-        *code = &code[len..];
+        *offset += len;
         return (TokenType::Comment, string);
     }
 
     if let Some(m) = COMMENT.find(code) {
-        *code = &code[m.end()..];
+        *offset += m.end();
         return (TokenType::Comment, m.as_bytes());
     }
 
     if let Some(m) = IDENTIFIER.find(code) {
-        *code = &code[m.end()..];
+        *offset += m.end();
         return (TokenType::Identifier, m.as_bytes());
     }
 
     if let Some(m) = HEXNUMBER.find(code) {
-        *code = &code[m.end()..];
+        *offset += m.end();
         return (TokenType::HexNumber, m.as_bytes());
     }
 
     if let Some(m) = NUMBER.find(code) {
-        *code = &code[m.end()..];
+        *offset += m.end();
         return (TokenType::Number, m.as_bytes());
     }
 
@@ -322,21 +414,21 @@ fn next_token<'a>(code: &mut &'a [u8]) -> (TokenType, &'a [u8]) {
                 }
             }
             let string = &code[..pos];
-            *code = &code[pos..];
-            return (TokenType::Other, string);
+            *offset += pos;
+            return (TokenType::String, string);
         }
     }
 
     if let Some(m) = LONG_BRACKET.find(code) {
         let len = find_long_bracket_end(code, m.end() - 2);
         let string = &code[..len];
-        *code = &code[len..];
+        *offset += len;
         return (TokenType::Other, string);
     }
 
     if code.len() > 0 {
         let tok = &code[..1];
-        *code = &code[1..];
+        *offset += 1;
         return (TokenType::Other, tok);
     }
 
@@ -362,20 +454,22 @@ mod test {
     use super::*;
     #[test]
     fn multiline_strings() {
-        let mut input: &[u8] = b"[==[foo[=[bar]=]baz]==]...";
-        let (tpe, bytes) = next_token(&mut input);
+        let input: &[u8] = b"[==[foo[=[bar]=]baz]==]...";
+        let mut offset = 0;
+        let (tpe, bytes) = next_token(&input, &mut offset);
         assert_eq!(tpe, TokenType::Other);
         assert_eq!(bytes, b"[==[foo[=[bar]=]baz]==]");
     }
 
     #[test]
     fn strings() {
-        let mut input: &[u8] = b"\"test\\\"a\\\"\"  'foo\\''";
-        let (tpe, bytes) = next_token(&mut input);
-        assert_eq!(tpe, TokenType::Other);
+        let input: &[u8] = b"\"test\\\"a\\\"\"  'foo\\''";
+        let mut offset = 0;
+        let (tpe, bytes) = next_token(&input, &mut offset);
+        assert_eq!(tpe, TokenType::String);
         assert_eq!(bytes, b"\"test\\\"a\\\"\"");
-        let (tpe, bytes) = next_token(&mut input);
-        assert_eq!(tpe, TokenType::Other);
+        let (tpe, bytes) = next_token(&input, &mut offset);
+        assert_eq!(tpe, TokenType::String);
         assert_eq!(bytes, b"'foo\\''");
     }
 
@@ -417,5 +511,10 @@ mod test {
     #[test]
     fn multiline_comments() {
         assert_eq!(transform(b"a = --[=[ blah \n blub ]=] 4"), b"a=4");
+    }
+
+    #[test]
+    fn rename_inside_load() {
+        assert_eq!(transform(b"--rename a->b\nA=load\"a=2\""), b"A=load\"b=2\"");
     }
 }

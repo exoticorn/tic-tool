@@ -283,8 +283,8 @@ impl Analysis {
             terminal,
         };
         let colors = [
-            (Color::DarkCyan, Color::White),
             (Color::DarkGreen, Color::White),
+            (Color::DarkCyan, Color::White),
             (Color::Black, Color::White),
             (Color::DarkBlue, Color::White),
             (Color::DarkMagenta, Color::White),

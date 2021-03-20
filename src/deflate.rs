@@ -7,6 +7,7 @@ pub fn analyze(data: &[u8]) -> Analysis {
         unpacked: vec![],
         literal_index: vec![],
         cost: vec![],
+        block_type: vec![]
     };
 
     let mut blocks: Vec<BlockAnalysis> = vec![];
@@ -14,6 +15,7 @@ pub fn analyze(data: &[u8]) -> Analysis {
     let mut is_final = false;
     while !is_final {
         is_final = bitstream.get_bit() == 1;
+        let block_start_pos = data.unpacked.len();
         let block_type = bitstream.get_bits(2);
         let header_item = bitstream.take_item();
         match block_type {
@@ -141,6 +143,7 @@ pub fn analyze(data: &[u8]) -> Analysis {
             }
             _ => panic!("Block type {} not implemented yet", block_type),
         }
+        data.block_type.extend(std::iter::repeat(block_type as u8).take(data.unpacked.len() - block_start_pos));
     }
 
     let mut ref_count = vec![0usize; data.unpacked.len()];
@@ -214,7 +217,7 @@ impl Analysis {
                                 } else if c == 256 {
                                     "EOB".to_string()
                                 } else if c < hlit as u32 + 257 {
-                                    format!("length({})", c - 257)
+                                    format!("length code {}", c)
                                 } else {
                                     format!("offset({})", c - 257 - hlit as u32)
                                 };
@@ -433,6 +436,7 @@ pub struct AnalysisData {
     pub unpacked: Vec<u8>,
     pub literal_index: Vec<usize>,
     pub cost: Vec<f32>,
+    pub block_type: Vec<u8>
 }
 
 struct BlockAnalysis {
@@ -539,6 +543,7 @@ fn decode_block(
                 (4, 67),
                 (4, 83),
                 (4, 99),
+                (4, 115),
                 (5, 131),
                 (5, 163),
                 (5, 195),

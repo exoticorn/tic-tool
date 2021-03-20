@@ -6,7 +6,7 @@ mod tic_file;
 use anyhow::{anyhow, bail, Result};
 use clap::Clap;
 use flate2::write::ZlibEncoder;
-use std::path::PathBuf;
+use std::{cmp, path::PathBuf};
 use std::{collections::HashMap, fs::File, io::prelude::*, sync::mpsc, time::Duration};
 
 #[derive(Clap)]
@@ -120,6 +120,8 @@ impl CmdPack {
             code = lua::Program::parse(&code).serialize(b' ');
         }
 
+        compute_rename_suggestions(&code);
+
         if self.new_palette {
             new_palette_default = Some(tic_file::Chunk {
                 type_: 0x11,
@@ -135,6 +137,84 @@ impl CmdPack {
 
         Ok(())
     }
+}
+
+fn compute_rename_suggestions(code: &[u8]) {
+    let program = lua::Program::parse(code);
+
+    let candidates = program.get_rename_candidates();
+
+    let mut compressed = vec![];
+    zopfli_rs::compress(
+        &zopfli_rs::Options::default(),
+        &zopfli_rs::Format::Deflate,
+        &code,
+        &mut compressed,
+    )
+    .unwrap();
+
+    let analysis = deflate::analyze(&compressed);
+    let analysis = analysis.data();
+
+    let mut renameable_count: HashMap<Vec<u8>, (f32, usize)> = HashMap::new();
+    for (id, offsets) in &candidates.renameable {
+        let count = renameable_count
+            .entry(id.clone())
+            .or_insert_with(|| (0., offsets[0]));
+        for &offset in offsets {
+            for o in offset..offset + id.len() {
+                if analysis.literal_index[o] == usize::MAX {
+                    count.0 += if analysis.block_type[o] == 2 { 1. } else { 0.1 };
+                }
+            }
+        }
+    }
+
+    let mut renameable_ids: Vec<(Vec<u8>, f32, usize)> = renameable_count
+        .into_iter()
+        .map(|(id, (count, offset))| {
+            let count = count / id.len() as f32;
+            (id, count, offset)
+        })
+        .collect();
+    renameable_ids.sort_unstable_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(cmp::Ordering::Less)
+            .then(a.2.cmp(&b.2))
+    });
+    print!("renameable ids:");
+    for &(ref id, count, _) in &renameable_ids {
+        print!("  {}: {}", std::str::from_utf8(id).unwrap(), count.ceil());
+    }
+    println!();
+
+    let mut candidate_ids: HashMap<u8, (f32, usize)> = HashMap::new();
+    for &offset in &candidates.candidate_chars {
+        if analysis.literal_index[offset] == usize::MAX {
+            candidate_ids
+                .entry(code[offset])
+                .or_insert_with(|| (0., offset))
+                .0 += if analysis.block_type[offset] == 2 {
+                1.
+            } else {
+                0.1
+            };
+        }
+    }
+    let mut candidate_ids: Vec<(u8, f32, usize)> = candidate_ids
+        .into_iter()
+        .map(|(c, (count, offset))| (c, count, offset))
+        .collect();
+    candidate_ids.sort_unstable_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(cmp::Ordering::Less)
+            .then(a.2.cmp(&b.2))
+    });
+    print!("candidate ids:");
+    for &(c, count, _) in &candidate_ids {
+        print!("  {}: {}", c as char, count.ceil());
+    }
+    println!();
 }
 
 #[derive(Clap)]

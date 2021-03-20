@@ -1,23 +1,83 @@
 use lazy_static::lazy_static;
 use regex::bytes::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct Program {
     tt: TokenTree,
-    renames: HashMap<Vec<u8>, Vec<u8>>,
+    _renames: HashMap<Vec<u8>, Vec<u8>>,
+}
+#[derive(Debug)]
+pub struct RenameCandidates {
+    pub renameable: HashMap<Vec<u8>, Vec<usize>>,
+    pub fixed: HashSet<Vec<u8>>,
+    pub candidate_chars: Vec<usize>,
 }
 
 impl Program {
     pub fn parse(code: &[u8]) -> Program {
         let tt = parse(code);
         let (tt, renames) = find_renames(tt);
+        let tt = apply_renames(&tt, &renames);
         let tt = apply_transform_to_load(tt);
-        Program { tt, renames }
+        Program {
+            tt,
+            _renames: renames,
+        }
     }
 
     pub fn serialize(&self, ws: u8) -> Vec<u8> {
-        let tt = apply_renames(&self.tt, &self.renames);
-        serialize(&tt, ws)
+        serialize(&self.tt, ws)
+    }
+
+    pub fn get_rename_candidates(&self) -> RenameCandidates {
+        let mut candidates = RenameCandidates {
+            renameable: HashMap::new(),
+            fixed: HashSet::new(),
+            candidate_chars: Vec::new(),
+        };
+
+        let renameable_ids = find_renamable_identifiers(&self.tt);
+
+        fn inner(
+            candidates: &mut RenameCandidates,
+            tt: &TokenTree,
+            renameable_ids: &HashSet<Vec<u8>>,
+        ) {
+            for token in tt {
+                match *token {
+                    TreeToken::Token {
+                        type_: TokenType::Identifier,
+                        offset,
+                        ref text,
+                    } => {
+                        if renameable_ids.contains(text) {
+                            candidates
+                                .renameable
+                                .entry(text.clone())
+                                .or_default()
+                                .push(offset);
+                        } else {
+                            candidates.fixed.insert(text.clone());
+                            candidates
+                                .candidate_chars
+                                .extend((0..text.len()).map(|i| offset + i));
+                        }
+                    }
+                    TreeToken::Token { offset, ref text, .. } => candidates.candidate_chars.extend(
+                        text.iter()
+                            .enumerate()
+                            .filter(|(_, c)| c.is_ascii_alphabetic())
+                            .map(|(i, _)| offset + i),
+                    ),
+                    TreeToken::SubTree(ref sub_tt) => inner(candidates, sub_tt, renameable_ids),
+                    TreeToken::CodeString(ref sub_tt) => inner(candidates, sub_tt, renameable_ids),
+                }
+            }
+        }
+
+        inner(&mut candidates, &self.tt, &renameable_ids);
+
+        candidates
     }
 }
 
@@ -145,6 +205,55 @@ fn apply_transform_to_load(tt: TokenTree) -> TokenTree {
     new_tt
 }
 
+fn find_renamable_identifiers(tt: &TokenTree) -> HashSet<Vec<u8>> {
+    fn inner(idents: &mut HashSet<Vec<u8>>, tt: &TokenTree) {
+        for (index, token) in tt.iter().enumerate() {
+            match (token, tt.get(index + 1)) {
+                (
+                    TreeToken::Token {
+                        type_: TokenType::Identifier,
+                        text: ref id_name,
+                        ..
+                    },
+                    Some(&TreeToken::Token {
+                        type_: TokenType::Other,
+                        ref text,
+                        ..
+                    }),
+                ) if text == b"=" => match id_name.as_slice() {
+                    b"TIC" | b"SCN" | b"OVR" => (),
+                    _ => {
+                        idents.insert(id_name.clone());
+                    }
+                },
+                (
+                    TreeToken::Token {
+                        type_: TokenType::Identifier,
+                        text: ref fn_text,
+                        ..
+                    },
+                    Some(&TreeToken::Token {
+                        type_: TokenType::Identifier,
+                        text: ref id_name,
+                        ..
+                    }),
+                ) if fn_text == b"function" => match id_name.as_slice() {
+                    b"TIC" | b"SCN" | b"OVR" => (),
+                    _ => {
+                        idents.insert(id_name.clone());
+                    }
+                },
+                (TreeToken::SubTree(ref sub_tt), _) => inner(idents, sub_tt),
+                (TreeToken::CodeString(ref sub_tt), _) => inner(idents, sub_tt),
+                _ => (),
+            }
+        }
+    }
+    let mut idents = HashSet::new();
+    inner(&mut idents, tt);
+    idents
+}
+
 fn flatten(tokens: &mut Vec<(TokenType, Vec<u8>)>, tt: &[TreeToken], ws: u8) {
     for token in tt {
         match *token {
@@ -212,8 +321,7 @@ fn serialize(tt: &[TreeToken], ws: u8) -> Vec<u8> {
 fn parse(code: &[u8]) -> TokenTree {
     fn parse_subtree(tokens: &mut TokenTree, code: &[u8], offset: &mut usize) {
         loop {
-            let token_start = *offset;
-            let (token_type, token_text) = next_token(code, offset);
+            let (token_type, token_text, token_start) = next_token(code, offset);
             if token_type == TokenType::EOF {
                 return;
             }
@@ -354,7 +462,7 @@ enum TokenType {
     Other,
 }
 
-fn next_token<'a>(code: &'a [u8], offset: &mut usize) -> (TokenType, &'a [u8]) {
+fn next_token<'a>(code: &'a [u8], offset: &mut usize) -> (TokenType, &'a [u8], usize) {
     lazy_static! {
         static ref WHITE_SPACE: Regex = Regex::new(r"\A\s+").unwrap();
         static ref LONG_BRACKET_COMMENT: Regex = Regex::new(r"\A--\[=*\[").unwrap();
@@ -364,11 +472,14 @@ fn next_token<'a>(code: &'a [u8], offset: &mut usize) -> (TokenType, &'a [u8]) {
         static ref HEXNUMBER: Regex =
             Regex::new(r"\A0[xX][[:xdigit:]]*(\.[[:xdigit:]]*)?([pP]-?\d+)?").unwrap();
         static ref LONG_BRACKET: Regex = Regex::new(r"\A\[=*\[").unwrap();
+        static ref COMPOUND_OPERATOR: Regex = Regex::new(r"\A(==|~=|<=|>=)").unwrap();
     }
 
     if let Some(m) = WHITE_SPACE.find(&code[*offset..]) {
         *offset += m.end();
     }
+
+    let start_offset = *offset;
 
     let code = &code[*offset..];
 
@@ -376,27 +487,27 @@ fn next_token<'a>(code: &'a [u8], offset: &mut usize) -> (TokenType, &'a [u8]) {
         let len = find_long_bracket_end(code, m.end() - 4);
         let string = &code[..len];
         *offset += len;
-        return (TokenType::Comment, string);
+        return (TokenType::Comment, string, start_offset);
     }
 
     if let Some(m) = COMMENT.find(code) {
         *offset += m.end();
-        return (TokenType::Comment, m.as_bytes());
+        return (TokenType::Comment, m.as_bytes(), start_offset);
     }
 
     if let Some(m) = IDENTIFIER.find(code) {
         *offset += m.end();
-        return (TokenType::Identifier, m.as_bytes());
+        return (TokenType::Identifier, m.as_bytes(), start_offset);
     }
 
     if let Some(m) = HEXNUMBER.find(code) {
         *offset += m.end();
-        return (TokenType::HexNumber, m.as_bytes());
+        return (TokenType::HexNumber, m.as_bytes(), start_offset);
     }
 
     if let Some(m) = NUMBER.find(code) {
         *offset += m.end();
-        return (TokenType::Number, m.as_bytes());
+        return (TokenType::Number, m.as_bytes(), start_offset);
     }
 
     if code.len() > 0 {
@@ -415,7 +526,7 @@ fn next_token<'a>(code: &'a [u8], offset: &mut usize) -> (TokenType, &'a [u8]) {
             }
             let string = &code[..pos];
             *offset += pos;
-            return (TokenType::String, string);
+            return (TokenType::String, string, start_offset);
         }
     }
 
@@ -423,16 +534,21 @@ fn next_token<'a>(code: &'a [u8], offset: &mut usize) -> (TokenType, &'a [u8]) {
         let len = find_long_bracket_end(code, m.end() - 2);
         let string = &code[..len];
         *offset += len;
-        return (TokenType::Other, string);
+        return (TokenType::Other, string, start_offset);
+    }
+
+    if let Some(m) = COMPOUND_OPERATOR.find(code) {
+        *offset += m.end();
+        return (TokenType::Other, m.as_bytes(), start_offset);
     }
 
     if code.len() > 0 {
         let tok = &code[..1];
         *offset += 1;
-        return (TokenType::Other, tok);
+        return (TokenType::Other, tok, start_offset);
     }
 
-    return (TokenType::EOF, b"");
+    return (TokenType::EOF, b"", start_offset);
 }
 
 fn find_long_bracket_end(code: &[u8], level: usize) -> usize {
@@ -456,7 +572,7 @@ mod test {
     fn multiline_strings() {
         let input: &[u8] = b"[==[foo[=[bar]=]baz]==]...";
         let mut offset = 0;
-        let (tpe, bytes) = next_token(&input, &mut offset);
+        let (tpe, bytes, _) = next_token(&input, &mut offset);
         assert_eq!(tpe, TokenType::Other);
         assert_eq!(bytes, b"[==[foo[=[bar]=]baz]==]");
     }
@@ -465,10 +581,10 @@ mod test {
     fn strings() {
         let input: &[u8] = b"\"test\\\"a\\\"\"  'foo\\''";
         let mut offset = 0;
-        let (tpe, bytes) = next_token(&input, &mut offset);
+        let (tpe, bytes, _) = next_token(&input, &mut offset);
         assert_eq!(tpe, TokenType::String);
         assert_eq!(bytes, b"\"test\\\"a\\\"\"");
-        let (tpe, bytes) = next_token(&input, &mut offset);
+        let (tpe, bytes, _) = next_token(&input, &mut offset);
         assert_eq!(tpe, TokenType::String);
         assert_eq!(bytes, b"'foo\\''");
     }

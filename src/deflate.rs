@@ -174,6 +174,12 @@ pub struct Analysis {
     blocks: Vec<BlockAnalysis>,
 }
 
+pub struct BlockSizes {
+    header: usize,
+    huffman: usize,
+    body: usize,
+}
+
 impl Analysis {
     pub fn data(&self) -> &AnalysisData {
         &self.data
@@ -332,11 +338,8 @@ impl Analysis {
         Ok(())
     }
 
-    pub fn print_sizes(&self) {
-        println!("Deflate bitstream size:");
-        let mut total = 0;
-        for (block_index, block) in self.blocks.iter().enumerate() {
-            let mut block_total = 3;
+    pub fn sizes(&self) -> Vec<BlockSizes> {
+        self.blocks.iter().map(|block| {
             let huffman_size = match block.block_type {
                 BlockType::StaticHuffman => 0,
                 BlockType::DynamicHuffman {
@@ -390,21 +393,39 @@ impl Analysis {
                     }
                 })
                 .sum::<usize>();
-            block_total += huffman_size + body_size;
+            BlockSizes {
+                header: 3,
+                huffman: huffman_size,
+                body: body_size
+            }
+        }).collect()
+    }
+
+    pub fn total_size(&self) -> usize {
+        self.sizes().into_iter().map(|b| b.header + b.huffman + b.body).sum()
+    }
+
+    pub fn print_sizes(&self) {
+        println!("Deflate bitstream size:");
+        let mut total = 0;
+        for (block_index, block) in self.sizes().into_iter().enumerate() {
+            let block_total = block.header + block.huffman + block.body;
             print!(
-                "block {:-2}: {:-4}'{} bytes = 0'3 bytes header + ",
+                "block {:-2}: {:-4}'{} bytes = {}'{} bytes header + ",
                 block_index,
                 block_total >> 3,
-                block_total & 7
+                block_total & 7,
+                block.header >> 3,
+                block.header & 7
             );
-            if huffman_size > 0 {
+            if block.huffman > 0 {
                 print!(
                     "{}'{} bytes huffman tables + ",
-                    huffman_size >> 3,
-                    huffman_size & 7
+                    block.huffman >> 3,
+                    block.huffman & 7
                 );
             }
-            println!("{}'{} bytes body", body_size >> 3, body_size & 7,);
+            println!("{}'{} bytes body", block.body >> 3, block.body & 7,);
             total += block_total;
         }
         println!("   Total: {:-4}'{} bytes", total >> 3, total & 7);

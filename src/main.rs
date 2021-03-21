@@ -6,7 +6,11 @@ mod tic_file;
 use anyhow::{anyhow, bail, Result};
 use clap::Clap;
 use flate2::write::ZlibEncoder;
-use std::{cmp, path::PathBuf};
+use std::{
+    cmp,
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+};
 use std::{collections::HashMap, fs::File, io::prelude::*, sync::mpsc, time::Duration};
 
 #[derive(Clap)]
@@ -49,6 +53,8 @@ struct CmdPack {
         about = "Don't transform (whitespace/directives) as lua src"
     )]
     no_transform: bool,
+    #[clap(short, long, about = "Automatically apply rename suggestions")]
+    auto_rename: bool,
     #[clap(short, long, about = "Strip chunks except for code and new palette")]
     strip: bool,
     #[clap(short, long, about = "Force new palette")]
@@ -116,18 +122,17 @@ impl CmdPack {
         }
 
         let mut code = code.ok_or_else(|| anyhow!("No code chunk found"))?;
-        let mut source_renames: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let mut source_renames: lua::Renaming = BTreeMap::new();
         if !self.no_transform {
             let program = lua::Program::parse(&code);
             code = program.serialize(b' ');
             source_renames = program.renames;
         }
 
-        {
-            let merged_renames = merge_renames(&source_renames, &compute_rename_suggestions(&code));
+        fn print_renames(src: &lua::Renaming, new: &lua::Renaming) {
+            let merged_renames = merge_renames(src, new);
             let mut merged_renames: Vec<(Vec<u8>, Vec<u8>)> = merged_renames.into_iter().collect();
             merged_renames.sort();
-            println!("Suggested renames:\n");
             for (src, dst) in merged_renames {
                 println!(
                     "-- rename {}->{}",
@@ -136,6 +141,42 @@ impl CmdPack {
                 );
             }
             println!();
+        }
+        if self.auto_rename {
+            fn compressed_size(code: &[u8]) -> usize {
+                deflate::analyze(&zopfli(code)).total_size()
+            }
+            let mut rename: lua::Renaming = BTreeMap::new();
+            let mut best_rename = rename.clone();
+            let mut best_size = compressed_size(&code);
+            let mut seen_renames: HashSet<lua::Renaming> = HashSet::new();
+            let mut current_code = code.clone();
+
+            loop {
+                let new_rename = compute_rename_suggestions(&current_code);
+                rename = merge_renames(&rename, &new_rename);
+                if !seen_renames.insert(rename.clone()) {
+                    break;
+                }
+                let mut program = lua::Program::parse(&current_code);
+                program.apply_renames(&new_rename);
+                current_code = program.serialize(b' ');
+                let size = compressed_size(&current_code);
+                if size < best_size {
+                    best_rename = rename.clone();
+                    best_size = size;
+                }
+            }
+
+            let mut program = lua::Program::parse(&code);
+            program.apply_renames(&best_rename);
+            code = program.serialize(b' ');
+
+            println!("Best auto renames found:\n");
+            print_renames(&source_renames, &best_rename);
+        } else {
+            println!("Suggested renames:\n");
+            print_renames(&source_renames, &compute_rename_suggestions(&code));
         }
 
         if self.new_palette {
@@ -155,19 +196,24 @@ impl CmdPack {
     }
 }
 
-fn compute_rename_suggestions(code: &[u8]) -> HashMap<Vec<u8>, Vec<u8>> {
-    let program = lua::Program::parse(code);
-
-    let candidates = program.get_rename_candidates();
-
+fn zopfli(code: &[u8]) -> Vec<u8> {
     let mut compressed = vec![];
     zopfli_rs::compress(
         &zopfli_rs::Options::default(),
         &zopfli_rs::Format::Deflate,
-        &code,
+        code,
         &mut compressed,
     )
     .unwrap();
+    compressed
+}
+
+fn compute_rename_suggestions(code: &[u8]) -> lua::Renaming {
+    let program = lua::Program::parse(code);
+
+    let candidates = program.get_rename_candidates();
+
+    let compressed = zopfli(code);
 
     let analysis = deflate::analyze(&compressed);
     let analysis = analysis.data();
@@ -273,20 +319,17 @@ fn compute_rename_suggestions(code: &[u8]) -> HashMap<Vec<u8>, Vec<u8>> {
         .collect()
 }
 
-fn merge_renames(
-    a: &HashMap<Vec<u8>, Vec<u8>>,
-    b: &HashMap<Vec<u8>, Vec<u8>>,
-) -> HashMap<Vec<u8>, Vec<u8>> {
-    let reverse: HashMap<&Vec<u8>, &Vec<u8>> = a.iter().map(|(src, dst)| (dst, src)).collect();
-    b.iter()
-        .map(|(src, dst)| {
-            if let Some(&prev_src) = reverse.get(&src) {
-                (prev_src.clone(), dst.clone())
-            } else {
-                (src.clone(), dst.clone())
-            }
-        })
-        .collect()
+fn merge_renames(a: &lua::Renaming, b: &lua::Renaming) -> lua::Renaming {
+    let reverse: BTreeMap<&Vec<u8>, &Vec<u8>> = a.iter().map(|(src, dst)| (dst, src)).collect();
+    let mut a = a.clone();
+    a.extend(b.iter().map(|(src, dst)| {
+        if let Some(&prev_src) = reverse.get(&src) {
+            (prev_src.clone(), dst.clone())
+        } else {
+            (src.clone(), dst.clone())
+        }
+    }));
+    a
 }
 
 #[derive(Clap)]

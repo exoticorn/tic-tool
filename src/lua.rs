@@ -1,10 +1,12 @@
 use lazy_static::lazy_static;
 use regex::bytes::Regex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap,HashMap, HashSet};
+
+pub type Renaming = BTreeMap<Vec<u8>, Vec<u8>>;
 
 pub struct Program {
     tt: TokenTree,
-    pub renames: HashMap<Vec<u8>, Vec<u8>>,
+    pub renames: Renaming,
 }
 #[derive(Debug)]
 pub struct RenameCandidates {
@@ -23,6 +25,10 @@ impl Program {
             tt,
             renames: renames,
         }
+    }
+
+    pub fn apply_renames(&mut self, renames: &Renaming) {
+        self.tt = apply_renames(&self.tt, renames);
     }
 
     pub fn serialize(&self, ws: u8) -> Vec<u8> {
@@ -85,8 +91,8 @@ pub fn is_valid_ident_start(c: u8) -> bool {
     c == b'_' || c.is_ascii_alphabetic()
 }
 
-fn find_renames(mut tt: TokenTree) -> (TokenTree, HashMap<Vec<u8>, Vec<u8>>) {
-    let mut renames = HashMap::new();
+fn find_renames(mut tt: TokenTree) -> (TokenTree, Renaming) {
+    let mut renames = BTreeMap::new();
     lazy_static! {
         static ref RE: Regex = Regex::new(r"^--\s*rename\s*(\w+)\s*->\s*(\w+)\s*$").unwrap();
     }
@@ -107,7 +113,7 @@ fn find_renames(mut tt: TokenTree) -> (TokenTree, HashMap<Vec<u8>, Vec<u8>>) {
     (tt, renames)
 }
 
-fn apply_renames(tt: &TokenTree, renames: &HashMap<Vec<u8>, Vec<u8>>) -> TokenTree {
+fn apply_renames(tt: &TokenTree, renames: &Renaming) -> TokenTree {
     let mut new_tt = vec![];
 
     for token in tt {

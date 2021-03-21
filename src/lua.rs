@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 pub struct Program {
     tt: TokenTree,
-    _renames: HashMap<Vec<u8>, Vec<u8>>,
+    pub renames: HashMap<Vec<u8>, Vec<u8>>,
 }
 #[derive(Debug)]
 pub struct RenameCandidates {
@@ -21,7 +21,7 @@ impl Program {
         let tt = apply_transform_to_load(tt);
         Program {
             tt,
-            _renames: renames,
+            renames: renames,
         }
     }
 
@@ -66,7 +66,7 @@ impl Program {
                     TreeToken::Token { offset, ref text, .. } => candidates.candidate_chars.extend(
                         text.iter()
                             .enumerate()
-                            .filter(|(_, c)| c.is_ascii_alphabetic())
+                            .filter(|(_, &c)| is_valid_ident_start(c))
                             .map(|(i, _)| offset + i),
                     ),
                     TreeToken::SubTree(ref sub_tt) => inner(candidates, sub_tt, renameable_ids),
@@ -79,6 +79,10 @@ impl Program {
 
         candidates
     }
+}
+
+pub fn is_valid_ident_start(c: u8) -> bool {
+    c == b'_' || c.is_ascii_alphabetic()
 }
 
 fn find_renames(mut tt: TokenTree) -> (TokenTree, HashMap<Vec<u8>, Vec<u8>>) {

@@ -116,11 +116,27 @@ impl CmdPack {
         }
 
         let mut code = code.ok_or_else(|| anyhow!("No code chunk found"))?;
+        let mut source_renames: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         if !self.no_transform {
-            code = lua::Program::parse(&code).serialize(b' ');
+            let program = lua::Program::parse(&code);
+            code = program.serialize(b' ');
+            source_renames = program.renames;
         }
 
-        compute_rename_suggestions(&code);
+        {
+            let merged_renames = merge_renames(&source_renames, &compute_rename_suggestions(&code));
+            let mut merged_renames: Vec<(Vec<u8>, Vec<u8>)> = merged_renames.into_iter().collect();
+            merged_renames.sort();
+            println!("Suggested renames:\n");
+            for (src, dst) in merged_renames {
+                println!(
+                    "-- rename {}->{}",
+                    std::str::from_utf8(&src).unwrap(),
+                    std::str::from_utf8(&dst).unwrap()
+                );
+            }
+            println!();
+        }
 
         if self.new_palette {
             new_palette_default = Some(tic_file::Chunk {
@@ -139,7 +155,7 @@ impl CmdPack {
     }
 }
 
-fn compute_rename_suggestions(code: &[u8]) {
+fn compute_rename_suggestions(code: &[u8]) -> HashMap<Vec<u8>, Vec<u8>> {
     let program = lua::Program::parse(code);
 
     let candidates = program.get_rename_candidates();
@@ -182,17 +198,17 @@ fn compute_rename_suggestions(code: &[u8]) {
             .unwrap_or(cmp::Ordering::Less)
             .then(a.2.cmp(&b.2))
     });
-    print!("renameable ids:");
-    for &(ref id, count, _) in &renameable_ids {
-        print!("  {}: {}", std::str::from_utf8(id).unwrap(), count.ceil());
-    }
-    println!();
+    // print!("renameable ids:");
+    // for &(ref id, count, _) in &renameable_ids {
+    //     print!("  {}: {}", std::str::from_utf8(id).unwrap(), count.ceil());
+    // }
+    // println!();
 
-    let mut candidate_ids: HashMap<u8, (f32, usize)> = HashMap::new();
+    let mut candidate_ids: HashMap<Vec<u8>, (f32, usize)> = HashMap::new();
     for &offset in &candidates.candidate_chars {
         if analysis.literal_index[offset] == usize::MAX {
             candidate_ids
-                .entry(code[offset])
+                .entry(vec![code[offset]])
                 .or_insert_with(|| (0., offset))
                 .0 += if analysis.block_type[offset] == 2 {
                 1.
@@ -201,20 +217,76 @@ fn compute_rename_suggestions(code: &[u8]) {
             };
         }
     }
-    let mut candidate_ids: Vec<(u8, f32, usize)> = candidate_ids
+    let id_count = renameable_ids.len();
+
+    let mut candidate_ids: Vec<(Vec<u8>, f32, usize)> = candidate_ids
         .into_iter()
         .map(|(c, (count, offset))| (c, count, offset))
         .collect();
+    fn white_space_efficiency(c: u8) -> u8 {
+        match c | 32 {
+            b'a'..=b'f' => 0,
+            b'p' | b'x' => 1,
+            _ => 2,
+        }
+    }
     candidate_ids.sort_unstable_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(cmp::Ordering::Less)
+            .then(white_space_efficiency(b.0[0]).cmp(&white_space_efficiency(a.0[0])))
             .then(a.2.cmp(&b.2))
     });
-    print!("candidate ids:");
-    for &(c, count, _) in &candidate_ids {
-        print!("  {}: {}", c as char, count.ceil());
+    // print!("candidate ids:");
+    // for &(ref id, count, _) in &candidate_ids {
+    //     print!("  {}: {}", std::str::from_utf8(id).unwrap(), count.ceil());
+    // }
+    // println!();
+
+    let mut candidate_ids: Vec<Vec<u8>> = candidate_ids.into_iter().map(|(id, ..)| id).collect();
+
+    if id_count > candidate_ids.len() {
+        let mut used_ids = candidates.fixed;
+        for &c in b"_ghijklmnoqrstuvwyzpxabcdefGHIJKLMNOQRSTUVWYZPXABCDEF" {
+            let id = vec![c];
+            if used_ids.insert(id.clone()) {
+                candidate_ids.push(id);
+            }
+        }
+        let mut pos = 0usize;
+        while id_count > candidate_ids.len() {
+            let d = ((pos as f32 * 2. + 0.75).sqrt() - 0.5).floor() as usize;
+            let x = pos - d * (d + 1) / 2;
+            let y = d - x;
+            let mut id = candidate_ids[y].clone();
+            id.extend_from_slice(&candidate_ids[x]);
+            if used_ids.insert(id.clone()) {
+                candidate_ids.push(id);
+            }
+            pos += 1;
+        }
     }
-    println!();
+
+    renameable_ids
+        .into_iter()
+        .map(|(id, ..)| id)
+        .zip(candidate_ids.into_iter().take(id_count))
+        .collect()
+}
+
+fn merge_renames(
+    a: &HashMap<Vec<u8>, Vec<u8>>,
+    b: &HashMap<Vec<u8>, Vec<u8>>,
+) -> HashMap<Vec<u8>, Vec<u8>> {
+    let reverse: HashMap<&Vec<u8>, &Vec<u8>> = a.iter().map(|(src, dst)| (dst, src)).collect();
+    b.iter()
+        .map(|(src, dst)| {
+            if let Some(&prev_src) = reverse.get(&src) {
+                (prev_src.clone(), dst.clone())
+            } else {
+                (src.clone(), dst.clone())
+            }
+        })
+        .collect()
 }
 
 #[derive(Clap)]

@@ -1,6 +1,6 @@
 use lazy_static::lazy_static;
 use regex::bytes::Regex;
-use std::collections::{BTreeMap,HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub type Renaming = BTreeMap<Vec<u8>, Vec<u8>>;
 
@@ -31,8 +31,8 @@ impl Program {
         self.tt = apply_renames(&self.tt, renames);
     }
 
-    pub fn serialize(&self, ws: u8) -> Vec<u8> {
-        serialize(&self.tt, ws)
+    pub fn serialize(&mut self, ws: u8) -> Vec<u8> {
+        serialize(&mut self.tt, ws)
     }
 
     pub fn get_rename_candidates(&self) -> RenameCandidates {
@@ -48,9 +48,14 @@ impl Program {
             candidates: &mut RenameCandidates,
             tt: &TokenTree,
             renameable_ids: &HashSet<Vec<u8>>,
+            delim: Option<u8>,
         ) {
             for token in tt {
                 match *token {
+                    TreeToken::Token {
+                        type_: TokenType::Comment,
+                        ..
+                    } => (),
                     TreeToken::Token {
                         type_: TokenType::Identifier,
                         offset,
@@ -64,24 +69,39 @@ impl Program {
                                 .push(offset);
                         } else {
                             candidates.fixed.insert(text.clone());
-                            candidates
-                                .candidate_chars
-                                .extend((0..text.len()).map(|i| offset + i));
+                            for i in 0..text.len() {
+                                if is_valid_ident_start(text[i]) {
+                                    candidates.candidate_chars.push(offset + i);
+                                }
+                            }
                         }
                     }
-                    TreeToken::Token { offset, ref text, .. } => candidates.candidate_chars.extend(
-                        text.iter()
-                            .enumerate()
-                            .filter(|(_, &c)| is_valid_ident_start(c))
-                            .map(|(i, _)| offset + i),
-                    ),
-                    TreeToken::SubTree(ref sub_tt) => inner(candidates, sub_tt, renameable_ids),
-                    TreeToken::CodeString(ref sub_tt) => inner(candidates, sub_tt, renameable_ids),
+                    TreeToken::Token {
+                        mut offset,
+                        ref text,
+                        ..
+                    } => {
+                        for &c in text {
+                            if Some(c) == delim {
+                                offset += 1;
+                            }
+                            if is_valid_ident_start(c) {
+                                candidates.candidate_chars.push(offset);
+                            }
+                            offset += 1;
+                        }
+                    }
+                    TreeToken::SubTree(ref sub_tt) => {
+                        inner(candidates, sub_tt, renameable_ids, delim)
+                    }
+                    TreeToken::CodeString(ref sub_tt) => {
+                        inner(candidates, sub_tt, renameable_ids, Some(b'"'))
+                    }
                 }
             }
         }
 
-        inner(&mut candidates, &self.tt, &renameable_ids);
+        inner(&mut candidates, &self.tt, &renameable_ids, None);
 
         candidates
     }
@@ -264,67 +284,89 @@ fn find_renamable_identifiers(tt: &TokenTree) -> HashSet<Vec<u8>> {
     idents
 }
 
-fn flatten(tokens: &mut Vec<(TokenType, Vec<u8>)>, tt: &[TreeToken], ws: u8) {
-    for token in tt {
-        match *token {
-            TreeToken::Token {
-                type_, ref text, ..
-            } => tokens.push((type_, text.clone())),
-            TreeToken::SubTree(ref sub_tt) => flatten(tokens, sub_tt, ws),
-            TreeToken::CodeString(ref sub_tt) => {
-                let body = serialize(sub_tt, ws);
-                let mut string = vec![b'"'];
-                for c in body {
-                    if c == b'"' {
-                        string.push(b'\\');
-                    }
-                    string.push(c);
-                }
-                string.push(b'"');
+fn serialize(tt: &mut [TreeToken], ws: u8) -> Vec<u8> {
+    struct LastToken {
+        type_: TokenType,
+        text: Vec<u8>,
+    }
 
-                tokens.push((TokenType::String, string));
+    fn inner(
+        tt: &mut [TreeToken],
+        last_token: &mut LastToken,
+        code: &mut Vec<u8>,
+        ws: u8,
+        delim: Option<u8>,
+    ) {
+        for token in tt {
+            match *token {
+                TreeToken::Token {
+                    type_,
+                    ref mut offset,
+                    ref text,
+                } => {
+                    if type_ == TokenType::Comment {
+                        continue;
+                    }
+
+                    match last_token.type_ {
+                        TokenType::Identifier
+                            if text[0] == b'_' || text[0].is_ascii_alphanumeric() =>
+                        {
+                            code.push(ws);
+                        }
+                        TokenType::Number
+                            if text[0] == b'.'
+                                || text[0].is_ascii_hexdigit()
+                                || (text[0].to_ascii_lowercase() == b'x'
+                                    && (last_token.text == b"0" || last_token.text == b".0")) =>
+                        {
+                            code.push(ws);
+                        }
+                        TokenType::HexNumber
+                            if text[0] == b'.'
+                                || text[0].is_ascii_hexdigit()
+                                || text[0].to_ascii_lowercase() == b'p' =>
+                        {
+                            code.push(ws);
+                        }
+                        _ => (),
+                    }
+                    *offset = code.len();
+                    for &c in text {
+                        if Some(c) == delim {
+                            code.push(b'\\');
+                        }
+                        code.push(c);
+                    }
+                    last_token.type_ = type_;
+                    last_token.text = text.clone();
+                }
+
+                TreeToken::SubTree(ref mut sub_tt) => {
+                    inner(sub_tt, last_token, code, ws, delim);
+                }
+                TreeToken::CodeString(ref mut sub_tt) => {
+                    if delim == Some(b'"') {
+                        code.push(b'\\');
+                    }
+                    code.push(b'"');
+                    last_token.type_ = TokenType::Other;
+                    inner(sub_tt, last_token, code, ws, Some(b'"'));
+                    if delim == Some(b'"') {
+                        code.push(b'\\');
+                    }
+                    code.push(b'"');
+                }
             }
         }
     }
-}
-
-fn serialize(tt: &[TreeToken], ws: u8) -> Vec<u8> {
-    let mut tokens = vec![];
-    flatten(&mut tokens, &tt, ws);
 
     let mut code = vec![];
-    let (mut last_token_type, mut last_token_text): (TokenType, &[u8]) = (TokenType::Other, &[]);
-    for &(token_type, ref token_text) in &tokens {
-        if token_type == TokenType::Comment {
-            continue;
-        }
-        match last_token_type {
-            TokenType::Identifier
-                if token_text[0] == b'_' || token_text[0].is_ascii_alphanumeric() =>
-            {
-                code.push(ws);
-            }
-            TokenType::Number
-                if token_text[0] == b'.'
-                    || token_text[0].is_ascii_hexdigit()
-                    || (token_text[0].to_ascii_lowercase() == b'x'
-                        && (last_token_text == b"0" || last_token_text == b".0")) =>
-            {
-                code.push(ws);
-            }
-            TokenType::HexNumber
-                if token_text[0] == b'.'
-                    || token_text[0].is_ascii_hexdigit()
-                    || token_text[0].to_ascii_lowercase() == b'p' =>
-            {
-                code.push(ws);
-            }
-            _ => (),
-        }
-        code.extend_from_slice(token_text);
-        last_token_type = token_type;
-        last_token_text = token_text.as_slice();
-    }
+    let mut last_token = LastToken {
+        type_: TokenType::Other,
+        text: vec![],
+    };
+    inner(tt, &mut last_token, &mut code, ws, None);
     code
 }
 
@@ -372,12 +414,51 @@ fn parse(code: &[u8]) -> TokenTree {
     parse_subtree(&mut tokens, code, &mut offset);
 
     fn parse_load_functions(tt: TokenTree) -> TokenTree {
+        lazy_static! {
+            static ref CODE_STRING_COMMENT: Regex = Regex::new(r"\A--\s*code\s+string").unwrap();
+        }
         let mut new_tt = vec![];
 
         let mut index = 0;
         while index < tt.len() {
             let token = &tt[index];
             index += 1;
+            fn make_code_string(text: &[u8], offset: usize) -> TreeToken {
+                let mut code = vec![];
+                let mut offset_map: HashMap<usize, usize> = HashMap::new();
+                let mut pos = 1;
+                while pos + 1 < text.len() {
+                    offset_map.insert(code.len(), offset + pos);
+                    code.push(match text[pos] {
+                        b'\\' => {
+                            pos += 1;
+                            match text[pos] {
+                                b'n' => b'\n',
+                                b'r' => b'\r',
+                                b't' => b'\t',
+                                b'\\' => b'\\',
+                                o => o,
+                            }
+                        }
+                        o => o,
+                    });
+                    pos += 1;
+                }
+                let mut sub_tt = parse(&code);
+                fn remap(tt: &mut TokenTree, offset_map: &HashMap<usize, usize>) {
+                    for token in tt {
+                        match token {
+                            TreeToken::Token { ref mut offset, .. } => {
+                                *offset = *offset_map.get(offset).unwrap()
+                            }
+                            TreeToken::SubTree(ref mut sub_tt) => remap(sub_tt, offset_map),
+                            TreeToken::CodeString(ref mut sub_tt) => remap(sub_tt, offset_map),
+                        }
+                    }
+                }
+                remap(&mut sub_tt, &offset_map);
+                TreeToken::CodeString(parse_load_functions(sub_tt))
+            }
             match (token, tt.get(index)) {
                 (
                     &TreeToken::Token {
@@ -391,41 +472,23 @@ fn parse(code: &[u8]) -> TokenTree {
                         ref text,
                     }),
                 ) if fn_name == b"load" => {
-                    let mut code = vec![];
-                    let mut offset_map: HashMap<usize, usize> = HashMap::new();
-                    let mut pos = 1;
-                    while pos + 1 < text.len() {
-                        offset_map.insert(code.len(), offset + pos);
-                        code.push(match text[pos] {
-                            b'\\' => {
-                                pos += 1;
-                                match text[pos] {
-                                    b'n' => b'\n',
-                                    b'r' => b'\r',
-                                    b't' => b'\t',
-                                    b'\\' => b'\\',
-                                    o => o,
-                                }
-                            }
-                            o => o,
-                        });
-                        pos += 1;
-                    }
-                    let mut sub_tt = parse(&code);
-                    fn remap(tt: &mut TokenTree, offset_map: &HashMap<usize, usize>) {
-                        for token in tt {
-                            match token {
-                                TreeToken::Token { ref mut offset, .. } => {
-                                    *offset = *offset_map.get(offset).unwrap()
-                                }
-                                TreeToken::SubTree(ref mut sub_tt) => remap(sub_tt, offset_map),
-                                TreeToken::CodeString(ref mut sub_tt) => remap(sub_tt, offset_map),
-                            }
-                        }
-                    }
-                    remap(&mut sub_tt, &offset_map);
                     new_tt.push(token.clone());
-                    new_tt.push(TreeToken::CodeString(sub_tt));
+                    new_tt.push(make_code_string(text, offset));
+                    index += 1;
+                }
+                (
+                    &TreeToken::Token {
+                        type_: TokenType::Comment,
+                        text: ref comment,
+                        ..
+                    },
+                    Some(&TreeToken::Token {
+                        type_: TokenType::String,
+                        offset,
+                        ref text,
+                    }),
+                ) if CODE_STRING_COMMENT.is_match(comment) => {
+                    new_tt.push(make_code_string(text, offset));
                     index += 1;
                 }
                 _ => new_tt.push(token.clone()),

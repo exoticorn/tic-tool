@@ -6,11 +6,7 @@ mod tic_file;
 use anyhow::{anyhow, bail, Result};
 use clap::Clap;
 use flate2::write::ZlibEncoder;
-use std::{
-    cmp,
-    collections::{BTreeMap, HashSet},
-    path::PathBuf,
-};
+use std::{cmp, collections::{BTreeMap, HashSet}, path::PathBuf, process::exit};
 use std::{collections::HashMap, fs::File, io::prelude::*, sync::mpsc, time::Duration};
 
 #[derive(Clap)]
@@ -75,6 +71,11 @@ struct CmdPack {
 
 impl CmdPack {
     fn exec(self) -> Result<()> {
+        if self.no_transform && self.auto_rename {
+            eprintln!("Both --no-transform and --auto-rename specified. Auto renaming needs transforms to be active.");
+            exit(1);
+        }
+
         self.run()?;
         if self.watch {
             use notify::{DebouncedEvent, RecursiveMode, Watcher};
@@ -122,61 +123,59 @@ impl CmdPack {
         }
 
         let mut code = code.ok_or_else(|| anyhow!("No code chunk found"))?;
-        let mut source_renames: lua::Renaming = BTreeMap::new();
         if !self.no_transform {
-            let program = lua::Program::parse(&code);
-            code = program.serialize(b' ');
-            source_renames = program.renames;
-        }
-
-        fn print_renames(src: &lua::Renaming, new: &lua::Renaming) {
-            let merged_renames = merge_renames(src, new);
-            let mut merged_renames: Vec<(Vec<u8>, Vec<u8>)> = merged_renames.into_iter().collect();
-            merged_renames.sort();
-            for (src, dst) in merged_renames {
-                println!(
-                    "-- rename {}->{}",
-                    std::str::from_utf8(&src).unwrap(),
-                    std::str::from_utf8(&dst).unwrap()
-                );
-            }
-            println!();
-        }
-        if self.auto_rename {
-            fn compressed_size(code: &[u8]) -> usize {
-                deflate::analyze(&zopfli(code)).total_size()
-            }
-            let mut rename: lua::Renaming = BTreeMap::new();
-            let mut best_rename = rename.clone();
-            let mut best_size = compressed_size(&code);
-            let mut seen_renames: HashSet<lua::Renaming> = HashSet::new();
-            let mut current_code = code.clone();
-
-            loop {
-                let new_rename = compute_rename_suggestions(&current_code);
-                rename = merge_renames(&rename, &new_rename);
-                if !seen_renames.insert(rename.clone()) {
-                    break;
-                }
-                let mut program = lua::Program::parse(&current_code);
-                program.apply_renames(&new_rename);
-                current_code = program.serialize(b' ');
-                let size = compressed_size(&current_code);
-                if size < best_size {
-                    best_rename = rename.clone();
-                    best_size = size;
-                }
-            }
-
             let mut program = lua::Program::parse(&code);
-            program.apply_renames(&best_rename);
             code = program.serialize(b' ');
+            let source_renames = program.renames.clone();
 
-            println!("Best auto renames found:\n");
-            print_renames(&source_renames, &best_rename);
-        } else {
-            println!("Suggested renames:\n");
-            print_renames(&source_renames, &compute_rename_suggestions(&code));
+            fn print_renames(renames: lua::Renaming) {
+                let mut renames: Vec<(Vec<u8>, Vec<u8>)> = renames.into_iter().collect();
+                renames.sort();
+                for (src, dst) in renames {
+                    println!(
+                        "-- rename {}->{}",
+                        std::str::from_utf8(&src).unwrap(),
+                        std::str::from_utf8(&dst).unwrap()
+                    );
+                }
+                println!();
+            }
+
+            let mut analysis = deflate::analyze(&zopfli(&code));
+
+            if self.auto_rename {
+                let mut rename: lua::Renaming = source_renames;
+                let mut best_rename = rename.clone();
+                let mut best_size = analysis.total_size();
+                let mut best_code = code;
+                let mut seen_renames: HashSet<lua::Renaming> = HashSet::new();
+                seen_renames.insert(rename.clone());
+    
+                loop {
+                    let new_rename = compute_rename_suggestions(&program, &analysis);
+                    rename = merge_renames(&rename, &new_rename);
+                    if !seen_renames.insert(rename.clone()) {
+                        break;
+                    }
+                    program.apply_renames(&new_rename);
+                    let new_code = program.serialize(b' ');
+                    analysis = deflate::analyze(&zopfli(&new_code));
+                    let size = analysis.total_size();
+                    if size < best_size {
+                        best_rename = rename.clone();
+                        best_size = size;
+                        best_code = new_code;
+                    }
+                }
+    
+                code = best_code;
+    
+                println!("Best auto renames found:\n");
+                print_renames(best_rename);
+            } else {
+                println!("Suggested renames:\n");
+                print_renames(merge_renames(&source_renames, &compute_rename_suggestions(&program, &analysis)));
+            }
         }
 
         if self.new_palette {
@@ -208,14 +207,8 @@ fn zopfli(code: &[u8]) -> Vec<u8> {
     compressed
 }
 
-fn compute_rename_suggestions(code: &[u8]) -> lua::Renaming {
-    let program = lua::Program::parse(code);
-
+fn compute_rename_suggestions(program: &lua::Program, analysis: &deflate::Analysis) -> lua::Renaming {
     let candidates = program.get_rename_candidates();
-
-    let compressed = zopfli(code);
-
-    let analysis = deflate::analyze(&compressed);
     let analysis = analysis.data();
 
     let mut renameable_count: HashMap<Vec<u8>, (f32, usize)> = HashMap::new();
@@ -244,17 +237,22 @@ fn compute_rename_suggestions(code: &[u8]) -> lua::Renaming {
             .unwrap_or(cmp::Ordering::Less)
             .then(a.2.cmp(&b.2))
     });
-    // print!("renameable ids:");
-    // for &(ref id, count, _) in &renameable_ids {
-    //     print!("  {}: {}", std::str::from_utf8(id).unwrap(), count.ceil());
-    // }
-    // println!();
+    print!("renameable ids:");
+    for &(ref id, count, _) in &renameable_ids {
+        print!("  {}: {}", std::str::from_utf8(id).unwrap(), count.ceil());
+    }
+    println!();
 
     let mut candidate_ids: HashMap<Vec<u8>, (f32, usize)> = HashMap::new();
     for &offset in &candidates.candidate_chars {
         if analysis.literal_index[offset] == usize::MAX {
+            let c= analysis.unpacked[offset];
+            if !lua::is_valid_ident_start(c) {
+                dbg!(std::str::from_utf8(&analysis.unpacked[offset - 10..offset]).unwrap());
+                dbg!(std::str::from_utf8(&analysis.unpacked[offset..offset+10]).unwrap());
+            }
             candidate_ids
-                .entry(vec![code[offset]])
+                .entry(vec![analysis.unpacked[offset]])
                 .or_insert_with(|| (0., offset))
                 .0 += if analysis.block_type[offset] == 2 {
                 1.
@@ -282,11 +280,11 @@ fn compute_rename_suggestions(code: &[u8]) -> lua::Renaming {
             .then(white_space_efficiency(b.0[0]).cmp(&white_space_efficiency(a.0[0])))
             .then(a.2.cmp(&b.2))
     });
-    // print!("candidate ids:");
-    // for &(ref id, count, _) in &candidate_ids {
-    //     print!("  {}: {}", std::str::from_utf8(id).unwrap(), count.ceil());
-    // }
-    // println!();
+    print!("candidate ids:");
+    for &(ref id, count, _) in &candidate_ids {
+        print!("  {}: {}", std::str::from_utf8(id).unwrap(), count.ceil());
+    }
+    println!();
 
     let mut candidate_ids: Vec<Vec<u8>> = candidate_ids.into_iter().map(|(id, ..)| id).collect();
 
@@ -417,9 +415,11 @@ fn compress_code(code: Vec<u8>, iterations: i32) -> tic_file::Chunk {
 
     print_char_distribution(analysis.data());
 
-    println!("Heatmap:\n");
-    analysis.print_heatmap().unwrap();
-    println!();
+    if code.len() <= 1024 {
+        println!("Heatmap:\n");
+        analysis.print_heatmap().unwrap();
+        println!();
+    }
 
     analysis.print_sizes();
     println!();

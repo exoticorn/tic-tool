@@ -90,7 +90,7 @@ impl CmdPack {
             watcher.watch(&self.input, RecursiveMode::NonRecursive)?;
             loop {
                 if let DebouncedEvent::Write(_) = rx.recv()? {
-                    println!();
+                    println!("\n---===###[...]###===---\n");
                     self.run()?;
                 }
             }
@@ -509,18 +509,55 @@ struct CmdAnalyze {
     input: PathBuf,
 }
 
+const CHUNK_NAMES: &[&'static str] = &[
+    "Tiles",
+    "Sprites",
+    "Cover Image",
+    "Map",
+    "Code (uncompressed)",
+    "Flags",
+    "Unknown",
+    "Unknown",
+    "SFX",
+    "Waveforms",
+    "Unknown",
+    "Palette",
+    "Music Patterns (old)",
+    "Music Tracks",
+    "Music Patterns",
+    "Code (compressed)",
+    "New Defaults",
+];
+
 impl CmdAnalyze {
     fn exec(self) -> Result<()> {
         let chunks = tic_file::load(self.input)?;
 
         for chunk in chunks {
-            println!("Chunk {:02x} - len {}", chunk.type_, chunk.data.len());
+            let name = if chunk.type_ > 0 && chunk.type_ as usize <= CHUNK_NAMES.len() {
+                CHUNK_NAMES[chunk.type_ as usize - 1]
+            } else {
+                "Unknown"
+            };
+            println!(
+                "Chunk '{}' ({:02x}) - len {}",
+                name,
+                chunk.type_,
+                chunk.data.len()
+            );
 
             match chunk.type_ {
                 0x10 => {
+                    use crossterm::tty::IsTty;
+                    use std::io::stdout;
                     let analysis = deflate::analyze(&chunk.data[2..]);
+                    println!();
                     analysis.disassemble();
-                    analysis.print_heatmap()?;
+                    if stdout().is_tty() {
+                        println!();
+                        analysis.print_heatmap()?;
+                    }
+                    println!();
                 }
                 _ => (),
             }

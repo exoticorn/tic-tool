@@ -21,10 +21,7 @@ impl Program {
         let (tt, renames) = find_renames(tt);
         let tt = apply_renames(&tt, &renames);
         let tt = apply_transform_to_load(tt);
-        Program {
-            tt,
-            renames: renames,
-        }
+        Program { tt, renames }
     }
 
     pub fn apply_renames(&mut self, renames: &Renaming) {
@@ -48,7 +45,7 @@ impl Program {
             candidates: &mut RenameCandidates,
             tt: &TokenTree,
             renameable_ids: &HashSet<Vec<u8>>,
-            delim: Option<u8>,
+            delim_stack: DelimStack,
         ) {
             for token in tt {
                 match *token {
@@ -82,9 +79,7 @@ impl Program {
                         ..
                     } => {
                         for &c in text {
-                            if Some(c) == delim {
-                                offset += 1;
-                            }
+                            offset += delim_stack.encode_length(c) - 1;
                             if is_valid_ident_start(c) {
                                 candidates.candidate_chars.push(offset);
                             }
@@ -92,16 +87,22 @@ impl Program {
                         }
                     }
                     TreeToken::SubTree(ref sub_tt) => {
-                        inner(candidates, sub_tt, renameable_ids, delim)
+                        inner(candidates, sub_tt, renameable_ids, delim_stack.clone())
                     }
-                    TreeToken::CodeString(ref sub_tt) => {
-                        inner(candidates, sub_tt, renameable_ids, Some(b'"'))
-                    }
+                    TreeToken::CodeString {
+                        tt: ref sub_tt,
+                        delim,
+                    } => inner(candidates, sub_tt, renameable_ids, delim_stack.push(delim)),
                 }
             }
         }
 
-        inner(&mut candidates, &self.tt, &renameable_ids, None);
+        inner(
+            &mut candidates,
+            &self.tt,
+            &renameable_ids,
+            DelimStack::empty(),
+        );
 
         candidates
     }
@@ -159,8 +160,14 @@ fn apply_renames(tt: &TokenTree, renames: &Renaming) -> TokenTree {
             TreeToken::SubTree(ref sub_tt) => {
                 new_tt.push(TreeToken::SubTree(apply_renames(sub_tt, renames)));
             }
-            TreeToken::CodeString(ref sub_tt) => {
-                new_tt.push(TreeToken::CodeString(apply_renames(sub_tt, renames)));
+            TreeToken::CodeString {
+                tt: ref sub_tt,
+                delim,
+            } => {
+                new_tt.push(TreeToken::CodeString {
+                    tt: apply_renames(sub_tt, renames),
+                    delim,
+                });
             }
         }
     }
@@ -222,13 +229,16 @@ fn apply_transform_to_load(tt: TokenTree) -> TokenTree {
                         offset: 0,
                         text: b"load".to_vec(),
                     });
-                    new_tt.push(TreeToken::CodeString(body));
+                    new_tt.push(TreeToken::CodeString {
+                        tt: body,
+                        delim: b'"',
+                    });
                     transform_next = false;
                 } else {
                     new_tt.push(token);
                 }
             }
-            TreeToken::CodeString(..) => new_tt.push(token),
+            TreeToken::CodeString { .. } => new_tt.push(token),
         }
     }
 
@@ -274,7 +284,7 @@ fn find_renamable_identifiers(tt: &TokenTree) -> HashSet<Vec<u8>> {
                     }
                 },
                 (TreeToken::SubTree(ref sub_tt), _) => inner(idents, sub_tt),
-                (TreeToken::CodeString(ref sub_tt), _) => inner(idents, sub_tt),
+                (TreeToken::CodeString { tt: ref sub_tt, .. }, _) => inner(idents, sub_tt),
                 _ => (),
             }
         }
@@ -282,6 +292,51 @@ fn find_renamable_identifiers(tt: &TokenTree) -> HashSet<Vec<u8>> {
     let mut idents = HashSet::new();
     inner(&mut idents, tt);
     idents
+}
+
+#[derive(Clone)]
+struct DelimStack(Vec<u8>);
+
+impl DelimStack {
+    fn empty() -> DelimStack {
+        DelimStack(vec![])
+    }
+
+    fn push(&self, delim: u8) -> DelimStack {
+        let mut v = vec![delim];
+        v.extend_from_slice(&self.0);
+        DelimStack(v)
+    }
+
+    fn encode(&self, dst: &mut Vec<u8>, c: u8) {
+        fn inner(dst: &mut Vec<u8>, c: u8, stack: &[u8]) {
+            if !stack.is_empty() {
+                if c == b'\\' || c == stack[0] {
+                    inner(dst, b'\\', &stack[1..]);
+                }
+                inner(dst, c, &stack[1..]);
+            } else {
+                dst.push(c);
+            }
+        }
+        inner(dst, c, &self.0);
+    }
+
+    fn encode_length(&self, c: u8) -> usize {
+        fn inner(c: u8, stack: &[u8]) -> usize {
+            let mut length = 0;
+            if !stack.is_empty() {
+                if c == b'\\' || c == stack[0] {
+                    length += inner(b'\\', &stack[1..]);
+                }
+                length += inner(c, &stack[1..]);
+            } else {
+                length = 1;
+            }
+            length
+        }
+        inner(c, &self.0)
+    }
 }
 
 fn serialize(tt: &mut [TreeToken], ws: u8) -> Vec<u8> {
@@ -295,7 +350,7 @@ fn serialize(tt: &mut [TreeToken], ws: u8) -> Vec<u8> {
         last_token: &mut LastToken,
         code: &mut Vec<u8>,
         ws: u8,
-        delim: Option<u8>,
+        delim_stack: DelimStack,
     ) {
         for token in tt {
             match *token {
@@ -333,29 +388,23 @@ fn serialize(tt: &mut [TreeToken], ws: u8) -> Vec<u8> {
                     }
                     *offset = code.len();
                     for &c in text {
-                        if Some(c) == delim {
-                            code.push(b'\\');
-                        }
-                        code.push(c);
+                        delim_stack.encode(code, c);
                     }
                     last_token.type_ = type_;
                     last_token.text = text.clone();
                 }
 
                 TreeToken::SubTree(ref mut sub_tt) => {
-                    inner(sub_tt, last_token, code, ws, delim);
+                    inner(sub_tt, last_token, code, ws, delim_stack.clone());
                 }
-                TreeToken::CodeString(ref mut sub_tt) => {
-                    if delim == Some(b'"') {
-                        code.push(b'\\');
-                    }
-                    code.push(b'"');
+                TreeToken::CodeString {
+                    tt: ref mut sub_tt,
+                    delim,
+                } => {
+                    delim_stack.encode(code, delim);
                     last_token.type_ = TokenType::Other;
-                    inner(sub_tt, last_token, code, ws, Some(b'"'));
-                    if delim == Some(b'"') {
-                        code.push(b'\\');
-                    }
-                    code.push(b'"');
+                    inner(sub_tt, last_token, code, ws, delim_stack.push(delim));
+                    delim_stack.encode(code, delim);
                 }
             }
         }
@@ -366,7 +415,7 @@ fn serialize(tt: &mut [TreeToken], ws: u8) -> Vec<u8> {
         type_: TokenType::Other,
         text: vec![],
     };
-    inner(tt, &mut last_token, &mut code, ws, None);
+    inner(tt, &mut last_token, &mut code, ws, DelimStack::empty());
     code
 }
 
@@ -452,12 +501,17 @@ fn parse(code: &[u8]) -> TokenTree {
                                 *offset = *offset_map.get(offset).unwrap()
                             }
                             TreeToken::SubTree(ref mut sub_tt) => remap(sub_tt, offset_map),
-                            TreeToken::CodeString(ref mut sub_tt) => remap(sub_tt, offset_map),
+                            TreeToken::CodeString {
+                                tt: ref mut sub_tt, ..
+                            } => remap(sub_tt, offset_map),
                         }
                     }
                 }
                 remap(&mut sub_tt, &offset_map);
-                TreeToken::CodeString(parse_load_functions(sub_tt))
+                TreeToken::CodeString {
+                    tt: parse_load_functions(sub_tt),
+                    delim: text[0],
+                }
             }
             match (token, tt.get(index)) {
                 (
@@ -509,7 +563,10 @@ enum TreeToken {
         text: Vec<u8>,
     },
     SubTree(TokenTree),
-    CodeString(TokenTree),
+    CodeString {
+        tt: TokenTree,
+        delim: u8,
+    },
 }
 
 impl TreeToken {

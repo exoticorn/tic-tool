@@ -6,7 +6,12 @@ mod tic_file;
 use anyhow::{anyhow, bail, Result};
 use clap::Clap;
 use flate2::write::ZlibEncoder;
-use std::{cmp, collections::{BTreeMap, HashSet}, path::PathBuf, process::exit};
+use std::{
+    cmp,
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+    process::exit,
+};
 use std::{collections::HashMap, fs::File, io::prelude::*, sync::mpsc, time::Duration};
 
 #[derive(Clap)]
@@ -150,7 +155,7 @@ impl CmdPack {
                 let mut best_code = code;
                 let mut seen_renames: HashSet<lua::Renaming> = HashSet::new();
                 seen_renames.insert(rename.clone());
-    
+
                 loop {
                     let new_rename = compute_rename_suggestions(&program, &analysis);
                     rename = merge_renames(&rename, &new_rename);
@@ -167,14 +172,17 @@ impl CmdPack {
                         best_code = new_code;
                     }
                 }
-    
+
                 code = best_code;
-    
+
                 println!("Best auto renames found:\n");
                 print_renames(best_rename);
             } else {
                 println!("Suggested renames:\n");
-                print_renames(merge_renames(&source_renames, &compute_rename_suggestions(&program, &analysis)));
+                print_renames(merge_renames(
+                    &source_renames,
+                    &compute_rename_suggestions(&program, &analysis),
+                ));
             }
         }
 
@@ -207,7 +215,10 @@ fn zopfli(code: &[u8]) -> Vec<u8> {
     compressed
 }
 
-fn compute_rename_suggestions(program: &lua::Program, analysis: &deflate::Analysis) -> lua::Renaming {
+fn compute_rename_suggestions(
+    program: &lua::Program,
+    analysis: &deflate::Analysis,
+) -> lua::Renaming {
     let candidates = program.get_rename_candidates();
     let analysis = analysis.data();
 
@@ -237,19 +248,19 @@ fn compute_rename_suggestions(program: &lua::Program, analysis: &deflate::Analys
             .unwrap_or(cmp::Ordering::Less)
             .then(a.2.cmp(&b.2))
     });
-    print!("renameable ids:");
-    for &(ref id, count, _) in &renameable_ids {
-        print!("  {}: {}", std::str::from_utf8(id).unwrap(), count.ceil());
-    }
-    println!();
+    // print!("renameable ids:");
+    // for &(ref id, count, _) in &renameable_ids {
+    //     print!("  {}: {}", std::str::from_utf8(id).unwrap(), count.ceil());
+    // }
+    // println!();
 
     let mut candidate_ids: HashMap<Vec<u8>, (f32, usize)> = HashMap::new();
     for &offset in &candidates.candidate_chars {
         if analysis.literal_index[offset] == usize::MAX {
-            let c= analysis.unpacked[offset];
+            let c = analysis.unpacked[offset];
             if !lua::is_valid_ident_start(c) {
                 dbg!(std::str::from_utf8(&analysis.unpacked[offset - 10..offset]).unwrap());
-                dbg!(std::str::from_utf8(&analysis.unpacked[offset..offset+10]).unwrap());
+                dbg!(std::str::from_utf8(&analysis.unpacked[offset..offset + 10]).unwrap());
             }
             candidate_ids
                 .entry(vec![analysis.unpacked[offset]])
@@ -280,16 +291,17 @@ fn compute_rename_suggestions(program: &lua::Program, analysis: &deflate::Analys
             .then(white_space_efficiency(b.0[0]).cmp(&white_space_efficiency(a.0[0])))
             .then(a.2.cmp(&b.2))
     });
-    print!("candidate ids:");
-    for &(ref id, count, _) in &candidate_ids {
-        print!("  {}: {}", std::str::from_utf8(id).unwrap(), count.ceil());
-    }
-    println!();
+    // print!("candidate ids:");
+    // for &(ref id, count, _) in &candidate_ids {
+    //     print!("  {}: {}", std::str::from_utf8(id).unwrap(), count.ceil());
+    // }
+    // println!();
 
     let mut candidate_ids: Vec<Vec<u8>> = candidate_ids.into_iter().map(|(id, ..)| id).collect();
 
     if id_count > candidate_ids.len() {
         let mut used_ids = candidates.fixed;
+        used_ids.extend(candidate_ids.iter().cloned());
         for &c in b"_ghijklmnoqrstuvwyzpxabcdefGHIJKLMNOQRSTUVWYZPXABCDEF" {
             let id = vec![c];
             if used_ids.insert(id.clone()) {

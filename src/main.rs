@@ -29,7 +29,7 @@ enum SubCommand {
     Extract(CmdExtract),
     #[clap(about = "Create an empty .tic file")]
     Empty(CmdEmpty),
-    #[clap(about = "Print out detailed information about a .tic file")]
+    #[clap(about = "Print out detailed information about a .tic file, incl. deflate disassembly")]
     Analyze(CmdAnalyze),
 }
 
@@ -56,6 +56,8 @@ struct CmdPack {
     no_transform: bool,
     #[clap(short, long, about = "Automatically apply rename suggestions")]
     auto_rename: bool,
+    #[clap(short = 'l', long, about = "Rename iteration limit (-1 = no limit)")]
+    rename_limit: Option<i32>,
     #[clap(short, long, about = "Strip chunks except for code and new palette")]
     strip: bool,
     #[clap(short, long, about = "Force new palette")]
@@ -66,9 +68,11 @@ struct CmdPack {
         short,
         long,
         default_value = "15",
-        about = "Number of zopfli iterations (default 15)"
+        about = "Number of zopfli iterations"
     )]
     iterations: u32,
+    #[clap(long, about = "Print heatmap even if code > 1kb")]
+    force_heatmap: bool,
     #[clap(about = "Either a .tic file or source code")]
     input: PathBuf,
     output: PathBuf,
@@ -156,6 +160,7 @@ impl CmdPack {
                 let mut seen_renames: HashSet<lua::Renaming> = HashSet::new();
                 seen_renames.insert(rename.clone());
 
+                let mut renames_left = self.rename_limit.unwrap_or(15);
                 loop {
                     let new_rename = compute_rename_suggestions(&program, &analysis);
                     rename = merge_renames(&rename, &new_rename);
@@ -170,6 +175,12 @@ impl CmdPack {
                         best_rename = rename.clone();
                         best_size = size;
                         best_code = new_code;
+                    }
+
+                    renames_left -= 1;
+                    if renames_left == 0 {
+                        println!("Rename limit reached, using best found so far");
+                        break;
                     }
                 }
 
@@ -194,7 +205,7 @@ impl CmdPack {
             });
         }
 
-        out_chunks.push(compress_code(code, self.iterations as i32));
+        out_chunks.push(compress_code(code, self.iterations as i32, self.force_heatmap));
         out_chunks.extend(new_palette_default.into_iter());
 
         tic_file::save(&self.output, &out_chunks)?;
@@ -398,7 +409,7 @@ impl CmdEmpty {
     }
 }
 
-fn compress_code(code: Vec<u8>, iterations: i32) -> tic_file::Chunk {
+fn compress_code(code: Vec<u8>, iterations: i32, force_heatmap: bool) -> tic_file::Chunk {
     let mut data = vec![];
     zopfli_rs::compress(
         &zopfli_rs::Options {
@@ -427,7 +438,7 @@ fn compress_code(code: Vec<u8>, iterations: i32) -> tic_file::Chunk {
 
     print_char_distribution(analysis.data());
 
-    if code.len() <= 1024 {
+    if code.len() <= 1024 || force_heatmap {
         println!("Heatmap:\n");
         analysis.print_heatmap().unwrap();
         println!();
